@@ -4,6 +4,12 @@
 
 <h1 align="center">rift</h1>
 
+<p align="center">
+  <a href="https://github.com/shxntanu/rift/stargazers"><img src="https://img.shields.io/github/stars/shxntanu/rift" alt="GitHub stars"></a>
+  <a href="https://github.com/shxntanu/rift/blob/main/LICENSE"><img src="https://img.shields.io/github/license/shxntanu/rift" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/Go-1.27%2B-00ADD8?logo=go&logoColor=white" alt="Go 1.27+">
+</p>
+
 rift is a blazing fast file transfer tool that moves the data over several SSH connections at
 once, splits big files across them with work stealing, and uses content-defined chunking
 for deltas. On a source tree it is several times faster than rsync, and a sync
