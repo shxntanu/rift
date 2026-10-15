@@ -37,10 +37,92 @@ type rconn struct {
 	rerr   error
 
 	closing   atomic.Bool
+	stopRead  atomic.Bool
+	stop      chan struct{}
+	readOnce  sync.Once
 	closeOnce sync.Once
+	closeErr  error
+
+	// an ack confirms its original send watermark, so an
+	// older barrier cannot hide frames sent while its reply was in flight.
+	ackMu sync.Mutex
+	sent  uint64
+	acked uint64
+	acks  map[frameAck]uint64
 
 	curFile *fileTask
 	curFH   *os.File
+}
+
+type frameAck struct {
+	t   proto.Type
+	seq uint64
+}
+
+// recordFrame runs before Send, since sending can flush buffered frames and
+// let the reader receive an acknowledgement before Send returns.
+func (rc *rconn) recordFrame(t proto.Type, p []byte) {
+	rc.ackMu.Lock()
+	defer rc.ackMu.Unlock()
+	rc.sent++
+	var ack frameAck
+	switch t {
+	case proto.TScan:
+		ack.t = proto.TScanDone
+	case proto.THashReq, proto.TSync:
+		d := proto.Dec{B: p}
+		ack.seq = d.Uvarint()
+		if t == proto.THashReq {
+			ack.t = proto.THashResp
+		} else {
+			ack.t = proto.TSyncAck
+		}
+	default:
+		return
+	}
+	if rc.acks == nil {
+		rc.acks = make(map[frameAck]uint64)
+	}
+	rc.acks[ack] = rc.sent
+}
+
+// recordScan accounts for the scan sent together with the hello, before the
+// rconn and its reader are created.
+func (rc *rconn) recordScan() { rc.recordFrame(proto.TScan, nil) }
+
+func (rc *rconn) send(t proto.Type, parts ...[]byte) error {
+	var p []byte
+	if len(parts) > 0 {
+		p = parts[0]
+	}
+	rc.recordFrame(t, p)
+	return rc.pc.Send(t, parts...)
+}
+
+func (rc *rconn) confirm(t proto.Type, seq uint64) {
+	rc.ackMu.Lock()
+	defer rc.ackMu.Unlock()
+	ack := frameAck{t, seq}
+	if n, ok := rc.acks[ack]; ok {
+		rc.acked = max(rc.acked, n)
+		delete(rc.acks, ack)
+	}
+}
+
+func (rc *rconn) unconfirmed() bool {
+	rc.ackMu.Lock()
+	defer rc.ackMu.Unlock()
+	return rc.sent != rc.acked
+}
+
+func (rc *rconn) startRead() {
+	rc.readOnce.Do(func() {
+		if rc.stopRead.Load() {
+			close(rc.dead)
+			return
+		}
+		go rc.readLoop()
+	})
 }
 
 type scanMsg struct {
@@ -169,26 +251,60 @@ func (s *session) connect(ctx context.Context, worker bool, id int, scanSpecs fu
 		hashCh: make(chan hashResp, 4),
 		syncCh: make(chan uint64, 4),
 		dead:   make(chan struct{}),
+		stop:   make(chan struct{}),
 	}
-	go rc.readLoop()
+	if scanSpecs != nil {
+		rc.recordScan()
+	}
+	rc.startRead()
 	return rc, nil
 }
 
-// close shuts the connection down in order: end our stream, let the server
-// finish and hang up, then release the reader. Workers must have stopped.
-func (rc *rconn) close() {
+// close ends our stream and waits for the server only when frames remain
+// unconfirmed. Workers must have stopped before it is called.
+func (rc *rconn) close() error {
 	rc.closeOnce.Do(func() {
+		pending := rc.unconfirmed()
 		rc.closing.Store(true)
-		if rc.curFH != nil {
-			rc.curFH.Close()
+		if !pending {
+			rc.stopRead.Store(true)
 		}
-		_ = rc.pc.CloseWrite()
+		close(rc.stop)
+		rc.startRead()
+		if rc.curFH != nil {
+			_ = rc.curFH.Close()
+		}
+		werr := rc.pc.CloseWrite()
+		if !pending {
+			// all server errors precede the last ack. Stop
+			// reading and reap in the background to skip the server-exit RTT.
+			_ = rc.tc.CloseRead()
+			<-rc.dead
+			rc.closeErr = rc.rerr
+			go func() { _ = rc.pc.Close() }()
+			return
+		}
+		// EOF replaces the final barrier for pending deletes
+		// and directory metadata. Drain errors before accepting server exit.
+		if werr != nil {
+			rc.closeErr = fmt.Errorf("connection %d: close write: %w", rc.id, werr)
+		}
+		timer := time.NewTimer(5 * time.Second)
+		defer timer.Stop()
 		select {
 		case <-rc.dead:
-		case <-time.After(5 * time.Second):
+		case <-timer.C:
+			rc.closeErr = errors.Join(rc.closeErr, fmt.Errorf("connection %d: timed out waiting for server exit", rc.id))
+			rc.stopRead.Store(true)
+			_ = rc.tc.CloseRead()
+			<-rc.dead
 		}
-		_ = rc.pc.Close()
+		rc.closeErr = errors.Join(rc.closeErr, rc.rerr)
+		if err := rc.pc.Close(); err != nil {
+			rc.closeErr = errors.Join(rc.closeErr, fmt.Errorf("connection %d: server exit: %w", rc.id, err))
+		}
 	})
+	return rc.closeErr
 }
 
 func (rc *rconn) readLoop() {
@@ -196,8 +312,11 @@ func (rc *rconn) readLoop() {
 	for {
 		t, p, err := rc.pc.Recv()
 		if err != nil {
-			if !rc.closing.Load() {
-				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			// Final-batch teardown expects clean EOF, but must retain a
+			// truncated frame or any other receive error.
+			cleanEOF := rc.closing.Load() && errors.Is(err, io.EOF)
+			if !rc.stopRead.Load() && !cleanEOF {
+				if errors.Is(err, io.EOF) {
 					err = errors.New("server closed the connection")
 				}
 				rc.rerr = fmt.Errorf("connection %d: %w", rc.id, err)
@@ -226,7 +345,10 @@ func (rc *rconn) dispatch(t proto.Type, p []byte) error {
 		if d.Err != nil {
 			return d.Err
 		}
-		rc.scanCh <- scanMsg{entries: entries}
+		select {
+		case rc.scanCh <- scanMsg{entries: entries}:
+		case <-rc.stop:
+		}
 	case proto.TScanDone:
 		d.Uvarint()
 		n := int(d.Uvarint())
@@ -234,7 +356,14 @@ func (rc *rconn) dispatch(t proto.Type, p []byte) error {
 		for range n {
 			warns = append(warns, d.Str())
 		}
-		rc.scanCh <- scanMsg{done: true, warnings: warns}
+		if d.Err != nil {
+			return d.Err
+		}
+		rc.confirm(proto.TScanDone, 0)
+		select {
+		case rc.scanCh <- scanMsg{done: true, warnings: warns}:
+		case <-rc.stop:
+		}
 	case proto.THashResp:
 		r := hashResp{req: d.Uvarint()}
 		n := int(d.Uvarint())
@@ -249,7 +378,11 @@ func (rc *rconn) dispatch(t proto.Type, p []byte) error {
 		if d.Err != nil {
 			return d.Err
 		}
-		rc.hashCh <- r
+		rc.confirm(proto.THashResp, r.req)
+		select {
+		case rc.hashCh <- r:
+		case <-rc.stop:
+		}
 	case proto.TSig:
 		id := d.Uvarint()
 		f := s.file(id)
@@ -289,11 +422,22 @@ func (rc *rconn) dispatch(t proto.Type, p []byte) error {
 		}
 		s.rangeProgress(f, n)
 	case proto.TSyncAck:
-		rc.syncCh <- d.Uvarint()
+		seq := d.Uvarint()
+		if d.Err != nil {
+			return d.Err
+		}
+		rc.confirm(proto.TSyncAck, seq)
+		select {
+		case rc.syncCh <- seq:
+		case <-rc.stop:
+		}
 	case proto.TError:
 		id := d.Uvarint()
 		code := d.U8()
 		msg := d.Str()
+		if d.Err != nil {
+			return d.Err
+		}
 		if code == proto.CodeFatal {
 			return fmt.Errorf("server: %s", msg)
 		}
@@ -344,7 +488,7 @@ func (rc *rconn) do(j *job) error {
 		rc.enc.Varint(f.e.Mtime)
 		rc.s.logf(">l %s -> %s", f.e.Path, f.e.Link)
 		rc.s.st.filesDone.Add(1)
-		return rc.pc.Send(proto.TSymlink, rc.enc.B)
+		return rc.send(proto.TSymlink, rc.enc.B)
 	case jobRange:
 		return rc.sendRange(j.rt)
 	case jobFinalize:
@@ -355,12 +499,12 @@ func (rc *rconn) do(j *job) error {
 		rc.enc.Uvarint(uint64(f.e.Mode))
 		rc.enc.Varint(f.e.Mtime)
 		rc.s.st.filesDone.Add(1)
-		return rc.pc.Send(proto.TFinalize, rc.enc.B)
+		return rc.send(proto.TFinalize, rc.enc.B)
 	case jobSigReq:
 		rc.enc.Reset()
 		rc.enc.Uvarint(j.f.id)
 		rc.enc.Str(j.f.e.Path)
-		if err := rc.pc.Send(proto.TSigReq, rc.enc.B); err != nil {
+		if err := rc.send(proto.TSigReq, rc.enc.B); err != nil {
 			return err
 		}
 		return rc.pc.Flush()
@@ -396,7 +540,7 @@ func (rc *rconn) put(f *fileTask) error {
 	s.st.bytesDone.Add(f.e.Size)
 	s.st.literal.Add(int64(len(data)))
 	s.st.filesDone.Add(1)
-	return rc.pc.Send(proto.TPut, rc.enc.B, data)
+	return rc.send(proto.TPut, rc.enc.B, data)
 }
 
 func readSmall(path string, buf []byte) ([]byte, error) {
@@ -474,7 +618,7 @@ func (rc *rconn) sendRange(rt *rangeTask) error {
 		rc.enc.Str(f.e.Path)
 		rc.enc.Uvarint(uint64(f.e.Size))
 		rc.enc.Uvarint(uint64(off))
-		if err := rc.pc.Send(proto.TRangeWrite, rc.enc.B, buf); err != nil {
+		if err := rc.send(proto.TRangeWrite, rc.enc.B, buf); err != nil {
 			return err
 		}
 		s.st.bytesDone.Add(n)
@@ -482,7 +626,7 @@ func (rc *rconn) sendRange(rt *rangeTask) error {
 	}
 	rc.enc.Reset()
 	rc.enc.Uvarint(f.id)
-	if err := rc.pc.Send(proto.TRangeClose, rc.enc.B); err != nil {
+	if err := rc.send(proto.TRangeClose, rc.enc.B); err != nil {
 		return err
 	}
 	return rc.pc.Flush()
@@ -554,7 +698,7 @@ func (rc *rconn) sendDelta(f *fileTask, sig *signature) error {
 	rc.enc.Uvarint(f.id)
 	rc.enc.Str(f.e.Path)
 	rc.enc.Uvarint(uint64(size))
-	if err := rc.pc.Send(proto.TDeltaBegin, rc.enc.B); err != nil {
+	if err := rc.send(proto.TDeltaBegin, rc.enc.B); err != nil {
 		return err
 	}
 	var literal, matched int64
@@ -563,7 +707,7 @@ func (rc *rconn) sendDelta(f *fileTask, sig *signature) error {
 			rc.enc.Reset()
 			rc.enc.Uvarint(uint64(op.off))
 			rc.enc.Uvarint(uint64(op.n))
-			if err := rc.pc.Send(proto.TDeltaCopy, rc.enc.B); err != nil {
+			if err := rc.send(proto.TDeltaCopy, rc.enc.B); err != nil {
 				return err
 			}
 			matched += op.n
@@ -574,7 +718,7 @@ func (rc *rconn) sendDelta(f *fileTask, sig *signature) error {
 			buf := rc.buf[:k]
 			r, _ := fh.ReadAt(buf, op.off+done)
 			clear(buf[r:]) // a changed file fails the server's hash check and is resent in full
-			if err := rc.pc.Send(proto.TDeltaData, buf); err != nil {
+			if err := rc.send(proto.TDeltaData, buf); err != nil {
 				return err
 			}
 			done += k
@@ -586,7 +730,7 @@ func (rc *rconn) sendDelta(f *fileTask, sig *signature) error {
 	rc.enc.Uvarint(uint64(f.e.Mode))
 	rc.enc.Varint(f.e.Mtime)
 	rc.enc.Hash(proto.Hash{Hi: sum.Hi, Lo: sum.Lo})
-	if err := rc.pc.Send(proto.TDeltaEnd, rc.enc.B); err != nil {
+	if err := rc.send(proto.TDeltaEnd, rc.enc.B); err != nil {
 		return err
 	}
 	s.logf(">d %s (%.0f%% reused)", f.e.Path, 100*float64(matched)/float64(max(size, 1)))
@@ -615,7 +759,7 @@ func (rc *rconn) sendMeta(ms []metaUpdate) error {
 			rc.enc.Uvarint(uint64(m.mode))
 			rc.enc.Varint(m.mtime)
 		}
-		if err := rc.pc.Send(proto.TMeta, rc.enc.B); err != nil {
+		if err := rc.send(proto.TMeta, rc.enc.B); err != nil {
 			return err
 		}
 		ms = ms[n:]
@@ -632,7 +776,7 @@ func (rc *rconn) sendDeletes(paths []string, flags uint8) error {
 		for _, p := range paths[:n] {
 			rc.enc.Str(p)
 		}
-		if err := rc.pc.Send(proto.TDelete, rc.enc.B); err != nil {
+		if err := rc.send(proto.TDelete, rc.enc.B); err != nil {
 			return err
 		}
 		paths = paths[n:]
@@ -649,7 +793,7 @@ func (rc *rconn) sendMkdirs(dirs []scan.Entry) error {
 			rc.enc.Str(e.Path)
 			rc.enc.Uvarint(uint64(e.Mode))
 		}
-		if err := rc.pc.Send(proto.TMkdirs, rc.enc.B); err != nil {
+		if err := rc.send(proto.TMkdirs, rc.enc.B); err != nil {
 			return err
 		}
 		dirs = dirs[n:]
@@ -661,7 +805,7 @@ func (rc *rconn) sendMkdirs(dirs []scan.Entry) error {
 func (rc *rconn) sync(seq uint64) error {
 	rc.enc.Reset()
 	rc.enc.Uvarint(seq)
-	if err := rc.pc.Send(proto.TSync, rc.enc.B); err != nil {
+	if err := rc.send(proto.TSync, rc.enc.B); err != nil {
 		return err
 	}
 	return rc.pc.Flush()

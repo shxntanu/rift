@@ -45,11 +45,14 @@ func TestConnectPipelinesScan(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer rc.close()
+			defer func() { _ = rc.close() }()
 			if s.remoteRoot != s.opt.Dst.Path || s.remotePlatform != "testos/testarch" {
 				t.Fatalf("remote = %q, %q", s.remoteRoot, s.remotePlatform)
 			}
 			if _, _, err := collectScan(rc, s.sched.abortCh); err != nil {
+				t.Fatal(err)
+			}
+			if err := rc.close(); err != nil {
 				t.Fatal(err)
 			}
 		})

@@ -403,7 +403,17 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 			if err := s.barrier(s.liveConns()); err != nil {
 				return nil, err
 			}
-			if !s.sched.hasWork() {
+			// An error before an ack can start a resend on another worker.
+			// Wait for it, then repeat only if frames remain unconfirmed;
+			// counting a barrier worker still returning would add an RTT.
+			if err := s.sched.waitIdle(); err != nil {
+				return nil, err
+			}
+			pending := false
+			for _, rc := range s.liveConns() {
+				pending = pending || rc.unconfirmed()
+			}
+			if !pending {
 				break
 			}
 		}
@@ -719,7 +729,9 @@ func (s *session) compareHashes(ctx context.Context, ctrl *rconn, cands []*scan.
 		for _, c := range cands[i:end] {
 			ctrl.enc.Str(c.Path)
 		}
-		if err := ctrl.pc.Send(proto.THashReq, ctrl.enc.B); err != nil {
+		// Optimization 2: hash replies confirm these frames too, so a
+		// checksum-only no-op can skip waiting for server exit.
+		if err := ctrl.send(proto.THashReq, ctrl.enc.B); err != nil {
 			return nil, err
 		}
 		nreq++
