@@ -56,96 +56,34 @@ repository.
 
 ## How it works
 
-A sync is a short conversation between the rift client and a `rift serve`
-process started over SSH on the remote end. Both are the same binary.
-
-**Warm syncs and watch mode.** rift starts a private local agent at
-`~/.rift/agent.sock` automatically. It retains handshaken server processes,
-compression streams and watched scans, and exits after 15 idle minutes.
-`--no-persist` runs directly without the agent. Simultaneous requests queue,
-so overlapping roots cannot race; switching destinations resets the warm pool.
-Rebuilt binaries start a matching agent while older requests finish.
-
-```sh
-rift watch --delete ./ me@server:/code/project
-```
-
-Watch mode syncs once, then syncs after saves (checked every 100 ms). Linux
-uses inotify; macOS uses FSEvents with an event-delivery fence. Warm scans
-re-stat only changed directories and discover new subtrees. Overflow, watch
-limits, replaced roots, uncertain event delivery and per-directory merge
-filters fall back to full walks; `--gitignore` still asks git for membership.
-Other platforms use periodic full scans. A warm no-op takes one scan round
-trip; a small edit that changes size usually takes two. Hash comparisons,
-deltas and type conflicts can require additional round trips.
-
-**Scanning.** The initial local tree is walked by a pool of goroutines sharing a
-stack of directories. Each directory is read through its own file descriptor
-and its entries are stat'ed with `fstatat`, so paths are never resolved from
-the root again. This walk runs while SSH is still connecting, so the file
-list is usually ready before the server is. The server walks its side the
-same way and sends the listing back in batches. Protected trees that you have
-nothing to send to, such as a remote-only `build/`, are skipped entirely.
-
-**Planning.** The client diffs the two listings by size and mtime. A file
-with the same size but a different mtime is the classic `git checkout` or
-build-tool case. Both sides hash such files in parallel with XXH3-128, and if
-the content matches, only the mtime is fixed and no data is sent. Files too
-big to hash cheaply go through the delta path, which notices identical
-content the same way.
-
-**Connections.** rift sizes its connection pool from the planned work and the
-hello round-trip time, up to 32 sessions (`-j` sets the maximum). Low-latency
-syncs retain an eight-session ceiling. The bandwidth-delay estimate targets
-1 GiB/s; this is a sizing heuristic, not a bandwidth measurement. SSH debug
-diagnostics supply the receiving channel's advertised window and both SSH
-version strings when available. Otherwise rift assumes the upstream 2 MiB
-window, or skips fixed-window scaling for identified HPN builds. `RIFT_DEBUG=1`
-shows the measurement and whether the window was observed or assumed. Each is a real,
-separate TCP connection with its own `ssh` process, so encryption spreads
-across cores and every connection gets its own congestion window. Extra
-connections are opened only when the plan calls for them; a one-file change
-uses one. Each connection keeps its own ControlMaster socket alive for 15
-minutes as a fallback when a server must be restarted. The agent retains the
-server streams themselves between runs. rift also asks SSH for
-AES-GCM, which is hardware-accelerated on any recent CPU.
-
-**Scheduling.** A pool of 24 readers opens and reads small files ahead of the
-connection workers, in scheduler priority order. A 64 MiB reservation budget
-covers queued and in-flight contents, with a separate 1,024-file bound for tiny
-files. Connection workers frame, compress and write those buffers. Large-file
-range reads use two buffers to overlap disk reads with compression and writes.
-
-Small files (up to 1 MiB) travel as a single message carrying
-path, mode, mtime and contents. They are sent in batches, and the server
-writes new files in place with their final permissions. Large files are
-queued largest first and cut into 1 MiB ranges, which any connection can
-write straight into a shared temp file on the server. When the queues run
-dry, an idle connection steals the back half of the biggest file still in
-flight. The last large file is therefore finished by all connections
-together, not by whichever one happened to pick it up.
-
-**Applying.** Each server connection has 16 FIFO apply lanes. Paths hash to a
-lane, preserving same-path order while unrelated files can be written in
-parallel; hash collisions simply serialize. Copied payloads are bounded to
-64 MiB and 256 operations per connection. Directory creation, deletions, reads,
-sync barriers, and directory metadata drain the pool. Delta sequences remain sequential. Metadata
-batches are split into individual path operations.
-
-**Deltas.** For a changed file of at least 128 KiB, the server computes a
-FastCDC signature: chunk lengths and hashes. Chunk boundaries depend on the
-content, so the client chunks its copy in one linear pass and sends back
-"copy this range" and "here are new bytes" instructions. The server rebuilds
-the file next to the original and checks the result against the client's
-whole-file hash. If anything doesn't match, the file is resent in full.
-
-**Wire format.** Both directions are a framed binary protocol inside a zstd
-stream. Frames are batched and flushed explicitly, so hundreds of small files
-become a few compressed writes.
-
-**Finishing.** Once every connection confirms that its writes have landed,
-deletions run (children before parents) and directory mtimes are restored
-last.
+| Optimization                | What it does                                                                                                                                                 |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Automatic deployment        | Starts the same binary on the remote over SSH; installs a matching server when needed.                                                                       |
+| Persistent agent            | Reuses server processes, compression streams and watched scans; exits after 15 idle minutes. Disable with `--no-persist`.                                    |
+| Safe session reuse          | Queues simultaneous syncs, resets connections when destinations change, and starts a matching agent after rebuilds.                                          |
+| Watch mode                  | `rift watch --delete ./ me@server:/code/project` syncs after saves, checking every 100 ms.                                                                   |
+| Incremental scans           | Uses inotify on Linux and FSEvents on macOS to re-scan changed directories; falls back to full walks when needed.                                            |
+| Parallel directory walks    | Scans directories concurrently and uses `fstatat` relative to open directory descriptors to avoid repeated path resolution.                                  |
+| Overlapped setup            | Scans locally while SSH connects, pipelines the remote scan behind hello, and warms worker connections during the remote scan.                               |
+| Pruned scans                | Skips protected remote-only trees; `--gitignore` uses git to determine file membership.                                                                      |
+| Metadata fast path          | Compares size and mtime first; hashes candidates in parallel with XXH3-128 to avoid sending unchanged contents.                                              |
+| Content-defined deltas      | FastCDC finds reusable chunks in changed files from 128 KiB; sends copy instructions and only the new bytes.                                                 |
+| Delta verification          | Checks the reconstructed file against the source hash; resends in full if verification fails.                                                                |
+| Adaptive connection count   | Uses planned work, hello RTT and the SSH window to size the pool: up to 8 on low-latency links, 32 otherwise.                                                |
+| SSH window detection        | Reads advertised windows when available; otherwise assumes 2 MiB, or skips fixed-window sizing for identified HPN builds.                                    |
+| Independent SSH connections | Gives each connection its own TCP window and encryption process; prefers hardware-accelerated AES-GCM.                                                       |
+| Warm SSH fallback           | Keeps separate ControlMaster sockets for 15 minutes so restarting a server can skip SSH handshakes.                                                          |
+| Small-file read-ahead       | 24 readers feed connection workers independently, bounded by 64 MiB and 1,024 files.                                                                         |
+| Batched small files         | Sends files up to 1 MiB with their metadata in one message; creates new files with final permissions.                                                        |
+| Parallel large files        | Schedules largest files first and writes 1 MiB chunks into shared temporary files across connections.                                                        |
+| Work stealing               | Idle connections take the back half of unfinished ranges to shorten the transfer tail.                                                                       |
+| Double-buffered reads       | Overlaps large-file disk reads with compression and network writes.                                                                                          |
+| Parallel server applies     | 16 lanes per connection apply independent paths concurrently, preserve same-path order, and bound queued payloads to 64 MiB.                                 |
+| Ordering fences             | Drains applies before namespace changes, reads, directory metadata and sync acknowledgements; keeps delta sequences sequential.                              |
+| Batched compression         | Packs binary frames into zstd streams and flushes batches, turning many small messages into fewer writes.                                                    |
+| Fewer round trips           | Avoids redundant barriers and server-exit waits; warm no-ops need one scan round trip, simple size-changing edits usually two.                               |
+| Ordered finishing           | Confirms file writes before deleting children then parents and restoring directory mtimes last.                                                              |
+| Optional direct TCP         | Experimental `--direct` uses SSH-bootstrapped AES-256-GCM streams to bypass SSH data overhead, with SSH fallback. [Security notes](docs/direct-security.md). |
 
 ## Install
 
