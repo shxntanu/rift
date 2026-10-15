@@ -91,7 +91,7 @@ type session struct {
 	id     string
 	src    string
 	dialer *transport.Dialer
-	sched  *sched
+	sched  *scheduler
 	st     stats
 	files  []*fileTask
 
@@ -249,7 +249,7 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 		id:     newSessionID(),
 		src:    src,
 		dialer: transport.NewDialer(opt.Dst, opt.Transport),
-		sched:  newSched(),
+		sched:  newScheduler(),
 		files:  []*fileTask{nil},
 		start:  start,
 		debug:  os.Getenv("RIFT_DEBUG") != "",

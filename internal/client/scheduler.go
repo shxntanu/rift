@@ -83,7 +83,7 @@ func (rt *rangeTask) split() *rangeTask {
 
 var errClosed = errors.New("scheduler closed")
 
-// sched hands out work to connection workers.
+// scheduler hands out work to connection workers.
 //
 // Priority order: per-connection jobs (barriers, final phase), urgent jobs
 // (finalizes and deltas, which unblock completion), large files largest
@@ -91,7 +91,7 @@ var errClosed = errors.New("scheduler closed")
 // files. When every queue is empty, an idle worker steals the upper half of
 // the largest range another worker is still sending, so the last big file is
 // finished by all connections together instead of one.
-type sched struct {
+type scheduler struct {
 	mu      sync.Mutex
 	cond    *sync.Cond
 	own     map[int][]job
@@ -109,8 +109,8 @@ type sched struct {
 	steals int
 }
 
-func newSched() *sched {
-	s := &sched{
+func newScheduler() *scheduler {
+	s := &scheduler{
 		own:     map[int][]job{},
 		active:  map[*rangeTask]struct{}{},
 		abortCh: make(chan struct{}),
@@ -119,7 +119,7 @@ func newSched() *sched {
 	return s
 }
 
-func (s *sched) join() bool {
+func (s *scheduler) join() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed || s.err != nil {
@@ -129,14 +129,14 @@ func (s *sched) join() bool {
 	return true
 }
 
-func (s *sched) leave() {
+func (s *scheduler) leave() {
 	s.mu.Lock()
 	s.workers--
 	s.cond.Broadcast()
 	s.mu.Unlock()
 }
 
-func (s *sched) abort(err error) {
+func (s *scheduler) abort(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.err == nil {
@@ -146,7 +146,7 @@ func (s *sched) abort(err error) {
 	s.cond.Broadcast()
 }
 
-func (s *sched) close() {
+func (s *scheduler) close() {
 	s.mu.Lock()
 	s.closed = true
 	s.cond.Broadcast()
@@ -155,7 +155,7 @@ func (s *sched) close() {
 
 // waitWorkers blocks until every joined worker has left. After close, no new
 // worker can join, so this is a stable point for tearing connections down.
-func (s *sched) waitWorkers() {
+func (s *scheduler) waitWorkers() {
 	s.mu.Lock()
 	for s.workers > 0 {
 		s.cond.Wait()
@@ -163,13 +163,13 @@ func (s *sched) waitWorkers() {
 	s.mu.Unlock()
 }
 
-func (s *sched) failed() error {
+func (s *scheduler) failed() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.err
 }
 
-func (s *sched) emptyLocked() bool {
+func (s *scheduler) emptyLocked() bool {
 	if len(s.urgent) > 0 || len(s.big) > 0 || len(s.small) > 0 {
 		return false
 	}
@@ -184,7 +184,7 @@ func (s *sched) emptyLocked() bool {
 // push adds jobs and adjusts the pending counter atomically, so waitIdle can
 // never observe the gap between "async result arrived" and "follow-up job
 // queued".
-func (s *sched) push(urgent, big, small []job, pendingDelta int) {
+func (s *scheduler) push(urgent, big, small []job, pendingDelta int) {
 	s.mu.Lock()
 	s.urgent = append(s.urgent, urgent...)
 	s.big = append(s.big, big...)
@@ -194,14 +194,14 @@ func (s *sched) push(urgent, big, small []job, pendingDelta int) {
 	s.mu.Unlock()
 }
 
-func (s *sched) pushOwn(worker int, j job) {
+func (s *scheduler) pushOwn(worker int, j job) {
 	s.mu.Lock()
 	s.own[worker] = append(s.own[worker], j)
 	s.cond.Broadcast()
 	s.mu.Unlock()
 }
 
-func (s *sched) rangeDone(rt *rangeTask) {
+func (s *scheduler) rangeDone(rt *rangeTask) {
 	s.mu.Lock()
 	delete(s.active, rt)
 	s.mu.Unlock()
@@ -210,7 +210,7 @@ func (s *sched) rangeDone(rt *rangeTask) {
 // next returns the next batch of jobs for worker w, blocking until work is
 // available. flush is invoked (without the lock held) before blocking so
 // buffered frames are not left sitting while the worker sleeps.
-func (s *sched) next(w int, out []job, flush func() error) ([]job, error) {
+func (s *scheduler) next(w int, out []job, flush func() error) ([]job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	flushed := false
@@ -274,7 +274,7 @@ func (s *sched) next(w int, out []job, flush func() error) ([]job, error) {
 	}
 }
 
-func (s *sched) stealLocked() *rangeTask {
+func (s *scheduler) stealLocked() *rangeTask {
 	var best *rangeTask
 	var bestRem int64
 	for rt := range s.active {
@@ -290,7 +290,7 @@ func (s *sched) stealLocked() *rangeTask {
 
 // waitIdle blocks until all queued work is done, no async results are
 // outstanding, and every worker is waiting.
-func (s *sched) waitIdle() error {
+func (s *scheduler) waitIdle() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for {
@@ -304,7 +304,7 @@ func (s *sched) waitIdle() error {
 	}
 }
 
-func (s *sched) hasWork() bool {
+func (s *scheduler) hasWork() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return !s.emptyLocked() || s.pending > 0
