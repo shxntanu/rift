@@ -32,6 +32,14 @@ Nothing needs to be installed on the server. The first time rift connects to
 a host, it copies a small static server binary into `~/.rift/bin` over the
 same SSH connection. The remote only needs `sh` and `gzip`.
 
+## Quickstart
+
+On Linux or macOS (Intel/AMD and ARM64), install the latest release without Go:
+
+```sh
+curl -fsSL https://github.com/shxntanu/rift/releases/latest/download/install.sh | sh
+```
+
 ## Wasn't rsync good enough?
 
 Yes, sure. `rsync` is just good enough and it works. But when I had to sync a local git repo to my
