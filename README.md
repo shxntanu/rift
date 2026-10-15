@@ -65,7 +65,27 @@ repository.
 A sync is a short conversation between the rift client and a `rift serve`
 process started over SSH on the remote end. Both are the same binary.
 
-**Scanning.** The local tree is walked by a pool of goroutines sharing a
+**Warm syncs and watch mode.** rift starts a private local agent at
+`~/.rift/agent.sock` automatically. It retains handshaken server processes,
+compression streams and watched scans, and exits after 15 idle minutes.
+`--no-persist` runs directly without the agent. Simultaneous requests queue,
+so overlapping roots cannot race; switching destinations resets the warm pool.
+Rebuilt binaries start a matching agent while older requests finish.
+
+```sh
+rift watch --delete ./ me@server:/code/project
+```
+
+Watch mode syncs once, then syncs after saves (checked every 100 ms). Linux
+uses inotify; macOS uses FSEvents with an event-delivery fence. Warm scans
+re-stat only changed directories and discover new subtrees. Overflow, watch
+limits, replaced roots, uncertain event delivery and per-directory merge
+filters fall back to full walks; `--gitignore` still asks git for membership.
+Other platforms use periodic full scans. A warm no-op takes one scan round
+trip; a small edit that changes size usually takes two. Hash comparisons,
+deltas and type conflicts can require additional round trips.
+
+**Scanning.** The initial local tree is walked by a pool of goroutines sharing a
 stack of directories. Each directory is read through its own file descriptor
 and its entries are stat'ed with `fstatat`, so paths are never resolved from
 the root again. This walk runs while SSH is still connecting, so the file
@@ -85,7 +105,8 @@ separate TCP connection with its own `ssh` process, so encryption spreads
 across cores and every connection gets its own congestion window. Extra
 connections are opened only when the plan calls for them; a one-file change
 uses one. Each connection keeps its own ControlMaster socket alive for 15
-minutes, so the next sync skips the SSH handshake. rift also asks SSH for
+minutes as a fallback when a server must be restarted. The agent retains the
+server streams themselves between runs. rift also asks SSH for
 AES-GCM, which is hardware-accelerated on any recent CPU.
 
 **Scheduling.** Small files (up to 1 MiB) travel as a single message carrying
@@ -174,7 +195,7 @@ rift's own options:
     --gitignore         send exactly what git would (see below)
     --delta-min=SIZE    smallest file to delta-transfer (default 128K)
     --no-fast-cipher    don't ask SSH for AES-GCM
-    --no-persist        don't keep SSH connections open between runs
+    --no-persist        disable the agent and warm server sessions
 ```
 
 ### Filters

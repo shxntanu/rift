@@ -1,9 +1,6 @@
 // Package server implements the receiving side of a rift session.
 //
-// A server is deliberately dumb and stateless across connections: every
-// connection gets its own server process, and the client coordinates all of
-// them. This lets the client spread work across many SSH connections and
-// rebalance it freely.
+// Connections can serve successive sessions while retaining watched scans.
 package server
 
 import (
@@ -23,6 +20,7 @@ import (
 	"github.com/shxntanu/rift/internal/cdc"
 	"github.com/shxntanu/rift/internal/proto"
 	"github.com/shxntanu/rift/internal/scan"
+
 	"github.com/zeebo/xxh3"
 	"golang.org/x/sys/unix"
 )
@@ -35,6 +33,7 @@ type server struct {
 	ranges  map[uint64]*rangeFile
 	delta   *deltaState
 	buf     []byte
+	cache   *scan.Cache
 }
 
 type rangeFile struct {
@@ -70,6 +69,11 @@ func Serve(rw io.ReadWriteCloser) error {
 		buf:    make([]byte, proto.ChunkSize),
 	}
 	defer s.cleanup()
+	defer func() {
+		if s.cache != nil {
+			s.cache.Close()
+		}
+	}()
 	if err := s.handshake(); err != nil {
 		return err
 	}
@@ -121,29 +125,10 @@ func (s *server) handshake() error {
 	if ver != proto.Version {
 		return fail(fmt.Errorf("protocol mismatch: client v%d, server v%d", ver, proto.Version))
 	}
-	for _, r := range s.session {
-		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9') {
-			return fail(fmt.Errorf("bad session id"))
-		}
-	}
-	if root == "~" || strings.HasPrefix(root, "~/") {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return fail(err)
-		}
-		root = filepath.Join(home, root[1:])
-	}
-	if root == "" {
-		root = "."
-	}
-	abs, err := filepath.Abs(root)
-	if err != nil {
+	if err := s.setSession(s.session, root); err != nil {
 		return fail(err)
 	}
-	if err := os.MkdirAll(abs, 0o755); err != nil {
-		return fail(err)
-	}
-	s.root = abs
+	abs := s.root
 
 	s.enc.Reset()
 	s.enc.Uvarint(proto.Version)
@@ -165,6 +150,15 @@ func (s *server) handshake() error {
 func (s *server) handle(t proto.Type, p []byte) error {
 	d := proto.Dec{B: p}
 	switch t {
+	case proto.TNewSession:
+		session, root := d.Str(), d.Str()
+		if d.Err != nil {
+			return d.Err
+		}
+		if err := s.setSession(session, root); err != nil {
+			return err
+		}
+		return nil
 	case proto.TScan:
 		return s.scan(&d)
 	case proto.THashReq:
@@ -258,7 +252,10 @@ func (s *server) scan(d *proto.Dec) error {
 	if err != nil {
 		return err
 	}
-	res, err := scan.Walk(context.Background(), s.root, scan.Options{Filter: filter})
+	if s.cache == nil {
+		s.cache = scan.NewCache(s.root)
+	}
+	res, err := s.cache.Scan(context.Background(), filter)
 	if err != nil {
 		return err
 	}
@@ -833,4 +830,40 @@ func (s *server) cleanup() {
 		}
 		delete(s.ranges, id)
 	}
+}
+
+func (s *server) setSession(session, root string) error {
+	if session == "" {
+		return errors.New("empty session id")
+	}
+	for _, r := range session {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9') {
+			return errors.New("bad session id")
+		}
+	}
+	if root == "~" || strings.HasPrefix(root, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		root = filepath.Join(home, root[1:])
+	}
+	if root == "" {
+		root = "."
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(abs, 0o755); err != nil {
+		return err
+	}
+	s.cleanup()
+	if s.root != abs && s.cache != nil {
+		s.cache.Close()
+		s.cache = nil
+	}
+	s.root = abs
+	s.session = session
+	return nil
 }

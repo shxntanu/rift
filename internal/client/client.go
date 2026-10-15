@@ -44,7 +44,7 @@ type Options struct {
 	Verbose        bool
 	Progress       bool
 	Transport      transport.Options
-	Log            io.Writer
+	Log            io.Writer `json:"-"`
 }
 
 // Summary describes a completed sync.
@@ -91,6 +91,8 @@ type session struct {
 	id     string
 	src    string
 	dialer *transport.Dialer
+	runner *Runner
+	ctx    context.Context
 	sched  *scheduler
 	st     stats
 	files  []*fileTask
@@ -234,6 +236,10 @@ func newSessionID() string {
 
 // Run performs a sync.
 func Run(ctx context.Context, opt Options) (*Summary, error) {
+	return run(ctx, opt, nil)
+}
+
+func run(ctx context.Context, opt Options, runner *Runner) (*Summary, error) {
 	start := time.Now()
 	if opt.Log == nil {
 		opt.Log = os.Stderr
@@ -255,8 +261,19 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 		start:  start,
 		debug:  os.Getenv("RIFT_DEBUG") != "",
 	}
+	s.runner = runner
+	if runner != nil {
+		s.dialer = runner.dialer
+	}
+	wireOut, wireIn := s.dialer.WireOut.Load(), s.dialer.WireIn.Load()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	s.ctx = ctx
+	stopRunner := func() bool { return false }
+	if runner != nil {
+		stopRunner = context.AfterFunc(runner.ctx, cancel)
+	}
+	defer stopRunner()
 
 	filter, err := scan.NewFilter(opt.Rules)
 	if err != nil {
@@ -270,12 +287,26 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 		err error
 	}
 	localCh := make(chan localScan, 1)
+	localDone := make(chan struct{})
+	defer func() { cancel(); <-localDone }()
 	go func() {
+		defer close(localDone)
 		var r localScan
 		if opt.GitIgnore {
 			r.res, r.err = scan.GitList(ctx, src, filter)
 		} else {
-			r.res, r.err = scan.Walk(ctx, src, scan.Options{Filter: filter})
+			if runner != nil {
+				if runner.cache == nil || runner.src != src {
+					if runner.cache != nil {
+						runner.cache.Close()
+					}
+					runner.cache = scan.NewCache(src)
+					runner.src = src
+				}
+				r.res, r.err = runner.cache.Scan(ctx, filter)
+			} else {
+				r.res, r.err = scan.Walk(ctx, src, scan.Options{Filter: filter})
+			}
 		}
 		localCh <- r
 	}()
@@ -302,6 +333,13 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 	}
 	s.debugf("primary connection ready (%s)", s.remotePlatform)
 	s.addConn(ctrl)
+	stopIO := context.AfterFunc(ctx, func() {
+		for _, rc := range s.liveConns() {
+			_ = rc.tc.CloseRead()
+			_ = rc.tc.CloseWrite()
+		}
+	})
+	defer stopIO()
 	var spawnWG sync.WaitGroup
 	var shutdownOnce sync.Once
 	var shutdownErr error
@@ -329,6 +367,7 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 			}
 			wg.Wait()
 			s.debugf("connections closed")
+			stopIO()
 			cancel()
 			spawnWG.Wait()
 			shutdownErr = errors.Join(closeErrs...)
@@ -410,12 +449,24 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 
 	s.spawnWorkers(ctx, &spawnWG, p)
 	go ctrl.work()
+	finalBatchFolded := false
 	if s.pushPlan(p) {
 		// Barriers make every server confirm it applied everything; delta
 		// failures reported before the ack queue full resends, so repeat.
 		for {
 			if err := s.sched.waitIdle(); err != nil {
 				return nil, err
+			}
+			// One stream orders file writes before directory times. With several
+			// streams, wait for their acknowledgements before setting final times.
+			finalBatchFolded = runner != nil && len(s.liveConns()) == 1
+			if finalBatchFolded {
+				s.sched.pushOwn(0, job{kind: jobFunc, fn: func(rc *rconn) error {
+					if err := rc.sendDeletes(p.deletes, 0); err != nil {
+						return err
+					}
+					return rc.sendMeta(p.dirMetas)
+				}})
 			}
 			if err := s.barrier(s.liveConns()); err != nil {
 				return nil, err
@@ -436,9 +487,9 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 		}
 	}
 
-	// send deletes and directory metadata last, and let EOF
-	// confirm this batch during teardown instead of sending a final barrier.
-	if len(p.deletes) > 0 || len(p.dirMetas) > 0 {
+	// Send the remaining deletes and directory times after all file writes.
+	// Teardown confirms them with EOF or a barrier on persistent streams.
+	if !finalBatchFolded && (len(p.deletes) > 0 || len(p.dirMetas) > 0) {
 		s.sched.pushOwn(0, job{kind: jobFunc, fn: func(rc *rconn) error {
 			if err := rc.sendDeletes(p.deletes, 0); err != nil {
 				return err
@@ -465,8 +516,8 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 	sum.Bytes = s.st.bytesTotal.Load()
 	sum.Literal = s.st.literal.Load()
 	sum.Matched = s.st.matched.Load()
-	sum.WireOut = s.dialer.WireOut.Load()
-	sum.WireIn = s.dialer.WireIn.Load()
+	sum.WireOut = s.dialer.WireOut.Load() - wireOut
+	sum.WireIn = s.dialer.WireIn.Load() - wireIn
 	s.errMu.Lock()
 	sum.Errors = s.errs
 	sum.ErrorCount = s.errCount
@@ -574,6 +625,12 @@ func (s *session) dialWorker(ctx context.Context, wg *sync.WaitGroup, id int) *w
 		if !s.sched.join() {
 			return
 		}
+		rc.dispatchMu.Lock()
+		rc.optional.Store(false)
+		if rc.rerr != nil {
+			s.sched.abort(rc.rerr)
+		}
+		rc.dispatchMu.Unlock()
 		rc.startRead()
 		s.addConn(rc)
 		s.debugf("connection %d ready", id)

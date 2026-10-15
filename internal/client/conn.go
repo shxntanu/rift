@@ -23,12 +23,15 @@ import (
 // planner during setup, then the worker loop) writes to it; a dedicated
 // reader goroutine dispatches everything the server sends back.
 type rconn struct {
-	id  int
-	s   *session
-	pc  *proto.Conn
-	tc  *transport.Conn
-	enc proto.Enc
-	buf []byte
+	dispatchMu     sync.Mutex
+	id             int
+	root, platform string
+	needsSession   bool
+	s              *session
+	pc             *proto.Conn
+	tc             *transport.Conn
+	enc            proto.Enc
+	buf            []byte
 
 	scanCh chan scanMsg
 	hashCh chan hashResp
@@ -36,10 +39,12 @@ type rconn struct {
 	dead   chan struct{}
 	rerr   error
 
+	optional  atomic.Bool
 	closing   atomic.Bool
 	stopRead  atomic.Bool
 	stop      chan struct{}
 	readOnce  sync.Once
+	stopOnce  sync.Once
 	closeOnce sync.Once
 	closeErr  error
 
@@ -147,10 +152,57 @@ type signature struct {
 // connect pipelines the primary's scan behind its hello. scanSpecs waits for
 // the local scan after dialing, while worker connections pass nil.
 func (s *session) connect(ctx context.Context, worker bool, id int, scanSpecs func() ([]string, error)) (*rconn, error) {
-	tc, err := s.dialer.Dial(ctx, worker, id)
+	if s.runner != nil {
+		if rc := s.runner.take(id, s); rc != nil {
+			if worker {
+				rc.needsSession = true
+				return rc, nil
+			}
+			var specs []string
+			var err error
+			if scanSpecs != nil {
+				specs, err = scanSpecs()
+				if err != nil {
+					rc.discard()
+					return nil, err
+				}
+			}
+			var enc proto.Enc
+			enc.Str(s.id)
+			enc.Str(s.opt.Dst.Path)
+			err = rc.send(proto.TNewSession, enc.B)
+			if err == nil && scanSpecs != nil {
+				enc.Reset()
+				enc.Uvarint(uint64(len(specs)))
+				for _, spec := range specs {
+					enc.Str(spec)
+				}
+				err = rc.send(proto.TScan, enc.B)
+			}
+			if err == nil {
+				err = rc.pc.Flush()
+			}
+			if err != nil {
+				rc.discard()
+				return nil, err
+			}
+			if id == 0 {
+				s.remoteRoot = rc.root
+				s.remotePlatform = rc.platform
+			}
+			return rc, nil
+		}
+	}
+	dialCtx := ctx
+	if s.runner != nil {
+		dialCtx = s.runner.ctx
+	}
+	tc, err := s.dialer.Dial(dialCtx, worker, id)
 	if err != nil {
 		return nil, err
 	}
+	stopDial := context.AfterFunc(ctx, func() { _ = tc.CloseRead(); _ = tc.CloseWrite() })
+	defer stopDial()
 	var specs []string
 	if scanSpecs != nil {
 		specs, err = scanSpecs()
@@ -242,7 +294,8 @@ func (s *session) connect(ctx context.Context, worker bool, id int, scanSpecs fu
 		s.remotePlatform = goos + "/" + goarch
 	}
 	rc := &rconn{
-		id:     id,
+		id:   id,
+		root: root, platform: goos + "/" + goarch,
 		s:      s,
 		pc:     pc,
 		tc:     tc,
@@ -253,6 +306,7 @@ func (s *session) connect(ctx context.Context, worker bool, id int, scanSpecs fu
 		dead:   make(chan struct{}),
 		stop:   make(chan struct{}),
 	}
+	rc.optional.Store(worker)
 	if scanSpecs != nil {
 		rc.recordScan()
 	}
@@ -268,12 +322,38 @@ func (s *session) connect(ctx context.Context, worker bool, id int, scanSpecs fu
 // unconfirmed. Workers must have stopped before it is called.
 func (rc *rconn) close() error {
 	rc.closeOnce.Do(func() {
+		if rc.s.runner != nil && rc.s.ctx.Err() == nil && rc.s.sched.failed() == nil {
+			rc.startRead()
+			if rc.curFH != nil {
+				_ = rc.curFH.Close()
+				rc.curFH = nil
+				rc.curFile = nil
+			}
+			if rc.unconfirmed() {
+				seq := rc.s.seq.Add(1)
+				rc.closeErr = rc.sync(seq)
+				if rc.closeErr == nil {
+					rc.closeErr = rc.waitSync(seq, rc.s.sched.abortCh)
+				}
+			}
+			select {
+			case <-rc.dead:
+				if rc.closeErr == nil {
+					rc.closeErr = rc.rerr
+				}
+			default:
+			}
+			if rc.closeErr == nil {
+				rc.s.runner.put(rc)
+				return
+			}
+		}
 		pending := rc.unconfirmed()
 		rc.closing.Store(true)
 		if !pending {
 			rc.stopRead.Store(true)
 		}
-		close(rc.stop)
+		rc.stopOnce.Do(func() { close(rc.stop) })
 		rc.startRead()
 		if rc.curFH != nil {
 			_ = rc.curFH.Close()
@@ -316,6 +396,8 @@ func (rc *rconn) readLoop() {
 	for {
 		t, p, err := rc.pc.Recv()
 		if err != nil {
+			rc.dispatchMu.Lock()
+			defer rc.dispatchMu.Unlock()
 			// Final-batch teardown expects clean EOF, but must retain a
 			// truncated frame or any other receive error.
 			cleanEOF := rc.closing.Load() && errors.Is(err, io.EOF)
@@ -324,15 +406,22 @@ func (rc *rconn) readLoop() {
 					err = errors.New("server closed the connection")
 				}
 				rc.rerr = fmt.Errorf("connection %d: %w", rc.id, err)
-				rc.s.sched.abort(rc.rerr)
+				if !rc.optional.Load() {
+					rc.s.sched.abort(rc.rerr)
+				}
 			}
 			return
 		}
+		rc.dispatchMu.Lock()
 		if err := rc.dispatch(t, p); err != nil {
 			rc.rerr = fmt.Errorf("connection %d: %w", rc.id, err)
-			rc.s.sched.abort(rc.rerr)
+			if !rc.optional.Load() {
+				rc.s.sched.abort(rc.rerr)
+			}
+			rc.dispatchMu.Unlock()
 			return
 		}
+		rc.dispatchMu.Unlock()
 	}
 }
 
@@ -465,6 +554,16 @@ func (rc *rconn) work() {
 func (rc *rconn) workJoined() {
 	s := rc.s
 	defer s.sched.leave()
+	if rc.needsSession {
+		rc.enc.Reset()
+		rc.enc.Str(s.id)
+		rc.enc.Str(s.opt.Dst.Path)
+		if err := rc.send(proto.TNewSession, rc.enc.B); err != nil {
+			s.sched.abort(err)
+			return
+		}
+		rc.needsSession = false
+	}
 	var batch []job
 	for {
 		jobs, err := s.sched.next(rc.id, batch[:0], rc.pc.Flush)

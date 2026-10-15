@@ -17,7 +17,7 @@ import (
 )
 
 // Version is bumped whenever the wire format changes incompatibly.
-const Version = 1
+const Version = 2
 
 // Magic is written raw by the server as the very first bytes of a session.
 const Magic = "RIFT!"
@@ -58,6 +58,7 @@ const (
 	TSync                        // C→S barrier
 	TSyncAck                     // S→C barrier reply
 	TError                       // S→C error report
+	TNewSession                  // C→S session id, root; compression stays negotiated
 )
 
 // Error codes carried by TError.
