@@ -8,12 +8,15 @@ GOBUILD  := CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)"
 # can install itself on any of them over ssh.
 TARGETS := linux/amd64 linux/arm64 darwin/arm64 darwin/amd64
 
-.PHONY: all rift cross install clean
+.PHONY: all rift cross bench install clean
 
-all: rift cross
+all: rift cross bench
 
 rift:
 	$(GOBUILD) -o bin/rift ./cmd/rift
+
+bench:
+	$(GOBUILD) -o bin/rift-bench ./cmd/rift-bench
 
 cross:
 	@for t in $(TARGETS); do \
