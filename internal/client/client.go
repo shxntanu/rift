@@ -1,0 +1,804 @@
+// Package client drives a rift sync: it scans both sides, plans the minimal
+// set of operations, and executes them over a pool of connections.
+package client
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/shxntanu/rift/internal/proto"
+	"github.com/shxntanu/rift/internal/scan"
+	"github.com/shxntanu/rift/internal/transport"
+)
+
+// Options configure a sync.
+type Options struct {
+	Src       string
+	Dst       transport.Endpoint
+	Conns     int
+	Compress  int // zstd level 1-4; 0 disables
+	Delete    bool
+	Checksum  bool
+	DryRun    bool
+	Rules     []string // rsync filter rules, e.g. "- *.o", "P /build/***", ":- .gitignore"
+	GitIgnore bool     // list files with git ls-files instead of walking
+	DeltaMin  int64
+
+	SizeOnly       bool
+	Update         bool  // skip files that are newer on the receiver
+	IgnoreExisting bool  // skip files that already exist on the receiver
+	ModifyWindow   int64 // seconds of mtime slack when comparing
+	Verbose        bool
+	Progress       bool
+	Transport      transport.Options
+	Log            io.Writer
+}
+
+// Summary describes a completed sync.
+type Summary struct {
+	Scanned       int
+	RemoteScanned int
+	Transferred   int64
+	Bytes         int64 // logical bytes of transferred files
+	Literal       int64 // file bytes actually sent
+	Matched       int64 // bytes reused from the remote via delta
+	MetaOnly      int
+	Deleted       int
+	WireOut       int64
+	WireIn        int64
+	Conns         int
+	Steals        int
+	Errors        []string
+	ErrorCount    int
+	ScanTime      time.Duration
+	Elapsed       time.Duration
+	Platform      string
+}
+
+type fileTask struct {
+	id        uint64
+	e         scan.Entry
+	isNew     bool
+	remaining atomic.Int64
+	failed    atomic.Bool
+}
+
+type stats struct {
+	bytesTotal atomic.Int64
+	bytesDone  atomic.Int64
+	filesTotal atomic.Int64
+	filesDone  atomic.Int64
+	literal    atomic.Int64
+	matched    atomic.Int64
+	metaOnly   atomic.Int64 // large files found identical after a delta signature
+}
+
+type session struct {
+	opt    Options
+	id     string
+	src    string
+	dialer *transport.Dialer
+	sched  *sched
+	st     stats
+	files  []*fileTask
+
+	remoteRoot     string
+	remotePlatform string
+
+	connMu sync.Mutex
+	conns  []*rconn
+	seq    atomic.Uint64
+
+	errMu    sync.Mutex
+	errs     []string
+	errCount int
+
+	logMu sync.Mutex
+	start time.Time
+	debug bool
+}
+
+func (s *session) debugf(format string, args ...any) {
+	if !s.debug {
+		return
+	}
+	s.logMu.Lock()
+	fmt.Fprintf(s.opt.Log, "[%7.1fms] "+format+"\n", append([]any{float64(time.Since(s.start).Microseconds()) / 1000}, args...)...)
+	s.logMu.Unlock()
+}
+
+func (s *session) file(id uint64) *fileTask {
+	if id == 0 || id >= uint64(len(s.files)) {
+		return nil
+	}
+	return s.files[id]
+}
+
+func (s *session) localPath(rel string) string {
+	if rel == "" {
+		return s.src
+	}
+	return s.src + "/" + rel
+}
+
+func (s *session) logf(format string, args ...any) {
+	if !s.opt.Verbose {
+		return
+	}
+	s.logMu.Lock()
+	fmt.Fprintf(s.opt.Log, format+"\n", args...)
+	s.logMu.Unlock()
+}
+
+func (s *session) recordErr(msg string) {
+	s.errMu.Lock()
+	s.errCount++
+	if len(s.errs) < 50 {
+		s.errs = append(s.errs, msg)
+	}
+	s.errMu.Unlock()
+}
+
+func (s *session) onServerError(id uint64, code uint8, msg string) {
+	f := s.file(id)
+	if f == nil {
+		s.recordErr("remote: " + msg)
+		return
+	}
+	if code == proto.CodeDeltaFailed {
+		s.logf("delta failed for %s (%s), resending in full", f.e.Path, msg)
+		f.isNew = false
+		s.sched.push(nil, s.fullJobs(f), nil, s.fullPending(f))
+		return
+	}
+	f.failed.Store(true)
+	s.recordErr(fmt.Sprintf("remote %s: %s", f.e.Path, msg))
+}
+
+// fullJobs returns the jobs that send f in its entirety.
+func (s *session) fullJobs(f *fileTask) []job {
+	if f.e.Size <= proto.ChunkSize {
+		return []job{{kind: jobPut, f: f}}
+	}
+	f.remaining.Store(f.e.Size)
+	f.failed.Store(false)
+	return []job{{kind: jobRange, f: f, rt: &rangeTask{f: f, end: f.e.Size}}}
+}
+
+func (s *session) fullPending(f *fileTask) int {
+	if f.e.Size <= proto.ChunkSize {
+		return 0
+	}
+	return 1
+}
+
+// rangeProgress records bytes acknowledged for a large file; once every
+// byte is in, the file is renamed into place by a finalize job.
+func (s *session) rangeProgress(f *fileTask, n int64) {
+	if f.remaining.Add(-n) != 0 {
+		return
+	}
+	if f.failed.Load() {
+		s.sched.push(nil, nil, nil, -1)
+		return
+	}
+	s.sched.push([]job{{kind: jobFinalize, f: f}}, nil, nil, -1)
+}
+
+func (s *session) addConn(rc *rconn) {
+	s.connMu.Lock()
+	s.conns = append(s.conns, rc)
+	s.connMu.Unlock()
+}
+
+func (s *session) liveConns() []*rconn {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	return append([]*rconn(nil), s.conns...)
+}
+
+// barrier waits until every connection has processed everything sent so
+// far, which also guarantees every server error has been received.
+func (s *session) barrier(conns []*rconn) error {
+	seq := s.seq.Add(1)
+	for _, rc := range conns {
+		s.sched.pushOwn(rc.id, job{kind: jobFunc, fn: func(rc *rconn) error { return rc.sync(seq) }})
+	}
+	for _, rc := range conns {
+		if err := rc.waitSync(seq, s.sched.abortCh); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func newSessionID() string {
+	var b [6]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+// Run performs a sync.
+func Run(ctx context.Context, opt Options) (*Summary, error) {
+	start := time.Now()
+	if opt.Log == nil {
+		opt.Log = os.Stderr
+	}
+	if opt.Conns < 1 {
+		opt.Conns = 1
+	}
+	src, err := filepath.Abs(opt.Src)
+	if err != nil {
+		return nil, err
+	}
+	s := &session{
+		opt:    opt,
+		id:     newSessionID(),
+		src:    src,
+		dialer: transport.NewDialer(opt.Dst, opt.Transport),
+		sched:  newSched(),
+		files:  []*fileTask{nil},
+		start:  start,
+		debug:  os.Getenv("RIFT_DEBUG") != "",
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	filter, err := scan.NewFilter(opt.Rules)
+	if err != nil {
+		return nil, err
+	}
+
+	// Scan locally while the primary connection is being established.
+	type localScan struct {
+		res *scan.Result
+		err error
+	}
+	localCh := make(chan localScan, 1)
+	go func() {
+		var r localScan
+		if opt.GitIgnore {
+			r.res, r.err = scan.GitList(ctx, src, filter)
+		} else {
+			r.res, r.err = scan.Walk(ctx, src, scan.Options{Filter: filter})
+		}
+		localCh <- r
+	}()
+
+	ctrl, err := s.connect(ctx, false, 0)
+	if err != nil {
+		return nil, err
+	}
+	s.debugf("primary connection ready (%s)", s.remotePlatform)
+	s.addConn(ctrl)
+	var spawnWG sync.WaitGroup
+	// Close connections gracefully (EOF lets servers finish and exit) before
+	// cancelling the context, which would kill processes still dialing.
+	defer func() {
+		if s.sched.failed() != nil || ctx.Err() != nil {
+			// Kill the processes so workers blocked on a dead pipe return.
+			cancel()
+		}
+		s.sched.close()
+		s.sched.waitWorkers()
+		s.debugf("closing %d connections", len(s.liveConns()))
+		var wg sync.WaitGroup
+		for _, rc := range s.liveConns() {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				rc.close()
+			}()
+		}
+		wg.Wait()
+		s.debugf("connections closed")
+		cancel()
+		spawnWG.Wait()
+		s.debugf("done")
+	}()
+
+	// The local scan usually finishes while ssh is still connecting. Its
+	// result lets the remote skip protected trees we have nothing to send to.
+	ls := <-localCh
+	if ls.err != nil {
+		return nil, ls.err
+	}
+	s.debugf("local scan: %d entries", len(ls.res.Entries))
+	remoteSpecs := filter.RemoteScanSpecs(ls.res.Entries)
+	if opt.GitIgnore {
+		remoteSpecs = append([]string{"- /.git"}, remoteSpecs...)
+		remoteSpecs = append(remoteSpecs, ":- .gitignore")
+	}
+	ctrl.enc.Reset()
+	ctrl.enc.Uvarint(uint64(len(remoteSpecs)))
+	for _, p := range remoteSpecs {
+		ctrl.enc.Str(p)
+	}
+	if err := ctrl.pc.Send(proto.TScan, ctrl.enc.B); err != nil {
+		return nil, err
+	}
+	if err := ctrl.pc.Flush(); err != nil {
+		return nil, err
+	}
+
+	remote, remoteWarn, err := collectScan(ctrl, s.sched.abortCh)
+	if err != nil {
+		return nil, err
+	}
+	s.debugf("remote scan: %d entries", len(remote))
+	for _, w := range ls.res.Warnings {
+		s.recordErr(w.Error())
+	}
+	for _, w := range remoteWarn {
+		s.recordErr("remote: " + w)
+	}
+	scanTime := time.Since(start)
+
+	p, err := s.plan(ctx, ctrl, ls.res, remote, filter)
+	if err != nil {
+		return nil, err
+	}
+	s.debugf("plan: %d transfers, %d deltas, %d meta, %d deletes", len(p.transfers), len(p.sigs), len(p.metas), len(p.deletes))
+
+	sum := &Summary{
+		Scanned:       len(ls.res.Entries),
+		RemoteScanned: len(remote),
+		ScanTime:      scanTime,
+		Platform:      s.remotePlatform,
+		MetaOnly:      len(p.metas),
+		Deleted:       len(p.deletes),
+	}
+	if opt.DryRun {
+		p.print(opt.Log)
+		sum.Transferred = int64(len(p.transfers))
+		for _, f := range p.transfers {
+			sum.Bytes += f.e.Size
+		}
+		sum.Elapsed = time.Since(start)
+		sum.Conns = 1
+		return sum, nil
+	}
+
+	stopProgress := func() {}
+	if opt.Progress && !opt.Verbose {
+		stopProgress = s.startProgress()
+	}
+	defer stopProgress()
+
+	// Conflicting paths and missing directories must exist before any
+	// worker writes files into them.
+	if len(p.conflicts) > 0 || len(p.mkdirs) > 0 {
+		if err := ctrl.sendDeletes(p.conflicts, proto.DeleteRecursive); err != nil {
+			return nil, err
+		}
+		if err := ctrl.sendMkdirs(p.mkdirs); err != nil {
+			return nil, err
+		}
+		seq := s.seq.Add(1)
+		if err := ctrl.sync(seq); err != nil {
+			return nil, err
+		}
+		if err := ctrl.waitSync(seq, s.sched.abortCh); err != nil {
+			return nil, err
+		}
+	}
+
+	s.spawnWorkers(ctx, &spawnWG, p)
+	go ctrl.work()
+	if s.pushPlan(p) {
+		// Barriers make every server confirm it applied everything; delta
+		// failures reported before the ack queue full resends, so repeat.
+		for {
+			if err := s.sched.waitIdle(); err != nil {
+				return nil, err
+			}
+			if err := s.barrier(s.liveConns()); err != nil {
+				return nil, err
+			}
+			if !s.sched.hasWork() {
+				break
+			}
+		}
+	}
+
+	// Deletions and directory metadata go last, once every file is in place.
+	if len(p.deletes) > 0 || len(p.dirMetas) > 0 {
+		s.sched.pushOwn(0, job{kind: jobFunc, fn: func(rc *rconn) error {
+			if err := rc.sendDeletes(p.deletes, 0); err != nil {
+				return err
+			}
+			return rc.sendMeta(p.dirMetas)
+		}})
+		if err := s.sched.waitIdle(); err != nil {
+			return nil, err
+		}
+		if err := s.barrier([]*rconn{ctrl}); err != nil {
+			return nil, err
+		}
+	}
+	stopProgress()
+	s.debugf("transfer complete")
+
+	s.sched.mu.Lock()
+	sum.Steals = s.sched.steals
+	s.sched.mu.Unlock()
+	sum.Conns = len(s.liveConns())
+	sum.Transferred = s.st.filesDone.Load() - s.st.metaOnly.Load()
+	sum.MetaOnly += int(s.st.metaOnly.Load())
+	sum.Bytes = s.st.bytesTotal.Load()
+	sum.Literal = s.st.literal.Load()
+	sum.Matched = s.st.matched.Load()
+	sum.WireOut = s.dialer.WireOut.Load()
+	sum.WireIn = s.dialer.WireIn.Load()
+	s.errMu.Lock()
+	sum.Errors = s.errs
+	sum.ErrorCount = s.errCount
+	s.errMu.Unlock()
+	sum.Elapsed = time.Since(start)
+	return sum, nil
+}
+
+// spawnWorkers opens extra connections sized to the planned work. They join
+// the pool whenever they are ready; work stealing rebalances around them, so
+// nothing waits for slow handshakes. Small syncs use the primary only.
+func (s *session) spawnWorkers(ctx context.Context, wg *sync.WaitGroup, p *plan) {
+	// Delta files mostly send copy instructions, so they count as files,
+	// not bytes.
+	var bytes int64
+	for _, f := range p.transfers {
+		bytes += f.e.Size
+	}
+	files := len(p.transfers) + len(p.sigs)
+	want := 1 + int(bytes/(4<<20)) + files/256 + len(p.sigs)/4
+	want = min(want, s.opt.Conns)
+	for i := 1; i < want; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rc, err := s.connect(ctx, true, i)
+			if err != nil {
+				if ctx.Err() == nil && i == 1 {
+					s.logf("extra connections unavailable (%v); continuing with fewer", err)
+				}
+				return
+			}
+			defer rc.close()
+			s.addConn(rc)
+			s.debugf("connection %d ready", i)
+			rc.work()
+		}()
+	}
+}
+
+func collectScan(rc *rconn, abort <-chan struct{}) ([]scan.Entry, []string, error) {
+	var entries []scan.Entry
+	for {
+		select {
+		case m := <-rc.scanCh:
+			if m.done {
+				return entries, m.warnings, nil
+			}
+			entries = append(entries, m.entries...)
+		case <-rc.dead:
+			if rc.rerr != nil {
+				return nil, nil, rc.rerr
+			}
+			return nil, nil, errors.New("connection closed during scan")
+		case <-abort:
+			return nil, nil, rc.s.sched.failed()
+		}
+	}
+}
+
+type plan struct {
+	conflicts []string
+	mkdirs    []scan.Entry
+	transfers []*fileTask
+	sigs      []*fileTask
+	symlinks  []*fileTask
+	metas     []metaUpdate
+	dirMetas  []metaUpdate
+	deletes   []string
+}
+
+func (p *plan) print(w io.Writer) {
+	for _, c := range p.conflicts {
+		fmt.Fprintf(w, "*replace %s\n", c)
+	}
+	for _, d := range p.mkdirs {
+		fmt.Fprintf(w, "cd+ %s/\n", d.Path)
+	}
+	for _, f := range p.transfers {
+		fmt.Fprintf(w, ">f %s\n", f.e.Path)
+	}
+	for _, f := range p.sigs {
+		fmt.Fprintf(w, ">d %s\n", f.e.Path)
+	}
+	for _, f := range p.symlinks {
+		fmt.Fprintf(w, ">l %s -> %s\n", f.e.Path, f.e.Link)
+	}
+	for _, m := range p.metas {
+		fmt.Fprintf(w, ".t %s\n", m.path)
+	}
+	for _, d := range p.deletes {
+		fmt.Fprintf(w, "*delete %s\n", d)
+	}
+}
+
+func (s *session) newTask(e scan.Entry, isNew bool) *fileTask {
+	f := &fileTask{id: uint64(len(s.files)), e: e, isNew: isNew}
+	s.files = append(s.files, f)
+	return f
+}
+
+func (s *session) plan(ctx context.Context, ctrl *rconn, lres *scan.Result, remote []scan.Entry,
+	filter *scan.Filter) (*plan, error) {
+	opt := s.opt
+	local := lres.Entries
+	p := &plan{}
+	window := opt.ModifyWindow * int64(time.Second)
+	sameTime := func(a, b int64) bool {
+		d := a - b
+		return d == 0 || (d <= window && -d <= window)
+	}
+	rmap := make(map[string]*scan.Entry, len(remote))
+	for i := range remote {
+		rmap[remote[i].Path] = &remote[i]
+	}
+	lmap := make(map[string]*scan.Entry, len(local))
+	for i := range local {
+		lmap[local[i].Path] = &local[i]
+	}
+	touched := map[string]bool{}
+	touch := func(rel string) {
+		touched[parentOf(rel)] = true
+	}
+	var hashCands []*scan.Entry
+
+	transfer := func(e scan.Entry, r *scan.Entry) {
+		if r != nil && e.Size >= opt.DeltaMin && r.Size > 0 && r.Kind == scan.KindFile {
+			p.sigs = append(p.sigs, s.newTask(e, false))
+		} else {
+			p.transfers = append(p.transfers, s.newTask(e, r == nil))
+		}
+		touch(e.Path)
+	}
+
+	for i := range local {
+		l := &local[i]
+		r := rmap[l.Path]
+		if r != nil && r.Kind != l.Kind && l.Path != "" {
+			p.conflicts = append(p.conflicts, l.Path)
+			touch(l.Path)
+			r = nil
+		}
+		switch l.Kind {
+		case scan.KindDir:
+			if r == nil {
+				p.mkdirs = append(p.mkdirs, *l)
+				touched[l.Path] = true
+				touch(l.Path)
+			} else if r.Mode != l.Mode || r.Mtime != l.Mtime {
+				touched[l.Path] = true
+			}
+		case scan.KindSymlink:
+			if r != nil && r.Link == l.Link {
+				continue
+			}
+			p.symlinks = append(p.symlinks, s.newTask(*l, r == nil))
+			touch(l.Path)
+		case scan.KindFile:
+			switch {
+			case r == nil:
+				transfer(*l, nil)
+			case opt.IgnoreExisting:
+			case opt.Update && r.Mtime > l.Mtime && !sameTime(r.Mtime, l.Mtime):
+			case r.Size == l.Size && (opt.SizeOnly || sameTime(r.Mtime, l.Mtime)) && !opt.Checksum:
+				if r.Mode != l.Mode {
+					p.metas = append(p.metas, metaUpdate{l.Path, l.Kind, l.Mode, l.Mtime})
+				}
+			case r.Size == l.Size && (l.Size < opt.DeltaMin || opt.Checksum):
+				hashCands = append(hashCands, l)
+			default:
+				transfer(*l, r)
+			}
+		}
+	}
+
+	if len(hashCands) > 0 {
+		same, err := s.compareHashes(ctx, ctrl, hashCands)
+		if err != nil {
+			return nil, err
+		}
+		for i, l := range hashCands {
+			r := rmap[l.Path]
+			if same[i] {
+				if r.Mode != l.Mode || !sameTime(r.Mtime, l.Mtime) {
+					p.metas = append(p.metas, metaUpdate{l.Path, l.Kind, l.Mode, l.Mtime})
+				}
+				continue
+			}
+			transfer(*l, r)
+		}
+	}
+
+	if opt.Delete {
+		var extra []string
+		for i := range remote {
+			r := &remote[i]
+			if r.Path == "" {
+				continue
+			}
+			if _, ok := lmap[r.Path]; ok {
+				continue
+			}
+			if filter.Protected(r.Path, r.Kind == scan.KindDir, lres.CtxFor(r.Path)) {
+				continue
+			}
+			extra = append(extra, r.Path)
+		}
+		if opt.GitIgnore && len(extra) > 0 {
+			query := make([]string, len(extra))
+			for i, e := range extra {
+				query[i] = e
+				if rmap[e].Kind == scan.KindDir {
+					query[i] += "/"
+				}
+			}
+			ignored, err := scan.GitIgnored(ctx, s.src, query)
+			if err != nil {
+				return nil, err
+			}
+			kept := extra[:0]
+			for _, e := range extra {
+				if !ignored[e] && !ignoredAncestor(e, ignored) {
+					kept = append(kept, e)
+				}
+			}
+			extra = kept
+		}
+		// Children before parents, so directories are empty when removed.
+		sort.Sort(sort.Reverse(sort.StringSlice(extra)))
+		for _, e := range extra {
+			p.deletes = append(p.deletes, e)
+			touch(e)
+		}
+	}
+
+	for d := range touched {
+		if l := lmap[d]; l != nil && l.Kind == scan.KindDir {
+			p.dirMetas = append(p.dirMetas, metaUpdate{l.Path, l.Kind, l.Mode, l.Mtime})
+		}
+	}
+
+	sort.Slice(p.mkdirs, func(i, j int) bool { return p.mkdirs[i].Path < p.mkdirs[j].Path })
+	for _, f := range p.transfers {
+		s.st.bytesTotal.Add(f.e.Size)
+	}
+	for _, f := range p.sigs {
+		s.st.bytesTotal.Add(f.e.Size)
+	}
+	s.st.filesTotal.Store(int64(len(p.transfers) + len(p.sigs) + len(p.symlinks)))
+	return p, nil
+}
+
+func ignoredAncestor(p string, ignored map[string]bool) bool {
+	for d := path.Dir(p); d != "." && d != "/"; d = path.Dir(d) {
+		if ignored[d] {
+			return true
+		}
+	}
+	return false
+}
+
+func parentOf(rel string) string {
+	if i := strings.LastIndexByte(rel, '/'); i >= 0 {
+		return rel[:i]
+	}
+	return ""
+}
+
+// compareHashes hashes candidates on both sides in parallel and reports
+// which ones have identical content.
+func (s *session) compareHashes(ctx context.Context, ctrl *rconn, cands []*scan.Entry) ([]bool, error) {
+	const batch = 2048
+	nreq := 0
+	for i := 0; i < len(cands); i += batch {
+		end := min(i+batch, len(cands))
+		ctrl.enc.Reset()
+		ctrl.enc.Uvarint(uint64(i))
+		ctrl.enc.Uvarint(uint64(end - i))
+		for _, c := range cands[i:end] {
+			ctrl.enc.Str(c.Path)
+		}
+		if err := ctrl.pc.Send(proto.THashReq, ctrl.enc.B); err != nil {
+			return nil, err
+		}
+		nreq++
+	}
+	if err := ctrl.pc.Flush(); err != nil {
+		return nil, err
+	}
+
+	local := make([]proto.Hash, len(cands))
+	localOK := make([]bool, len(cands))
+	var wg sync.WaitGroup
+	next := make(chan int, 256)
+	for range runtime.NumCPU() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, 256<<10)
+			for i := range next {
+				h, err := scan.HashFile(s.localPath(cands[i].Path), buf)
+				local[i], localOK[i] = h, err == nil
+			}
+		}()
+	}
+	for i := range cands {
+		next <- i
+	}
+	close(next)
+	wg.Wait()
+
+	same := make([]bool, len(cands))
+	for range nreq {
+		select {
+		case r := <-ctrl.hashCh:
+			for k := range r.hashes {
+				i := int(r.req) + k
+				if i < len(cands) && r.ok[k] && localOK[i] && r.hashes[k] == local[i] {
+					same[i] = true
+				}
+			}
+		case <-ctrl.dead:
+			return nil, ctrl.rerr
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return same, nil
+}
+
+// pushPlan enqueues every transfer and reports whether there was any.
+// Signature requests go first so the remote starts chunking basis files
+// while bulk data is already flowing.
+func (s *session) pushPlan(p *plan) bool {
+	var urgent, big, small []job
+	pending := 0
+	for _, f := range p.sigs {
+		urgent = append(urgent, job{kind: jobSigReq, f: f})
+		pending++
+	}
+	sort.Slice(p.transfers, func(i, j int) bool { return p.transfers[i].e.Size > p.transfers[j].e.Size })
+	for _, f := range p.transfers {
+		js := s.fullJobs(f)
+		pending += s.fullPending(f)
+		if js[0].kind == jobRange {
+			big = append(big, js...)
+		} else {
+			small = append(small, js...)
+		}
+	}
+	for _, f := range p.symlinks {
+		small = append(small, job{kind: jobSymlink, f: f})
+	}
+	for i := 0; i < len(p.metas); i += 4096 {
+		small = append(small, job{kind: jobMeta, metas: p.metas[i:min(i+4096, len(p.metas))]})
+	}
+	s.sched.push(urgent, big, small, pending)
+	return len(urgent)+len(big)+len(small) > 0
+}
