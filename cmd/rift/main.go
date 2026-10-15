@@ -67,7 +67,8 @@ rsync options:
   -P, --progress, --partial, --stats, -h   accepted
 
 rift options:
-  -j, --conns=N            parallel ssh connections (default 8)
+  -j, --conns=N            maximum connections (auto-sized, default 32)
+      --direct             experimental encrypted TCP data path; SSH fallback
       --gitignore          send exactly what git sees (git ls-files); never
                            deletes ignored files or .git on the receiver
       --delta-min=SIZE     delta-transfer changed files at least SIZE (128K)
@@ -204,6 +205,7 @@ func run(args []string) int {
 		Verbose:        cfg.verbose > 0 || cfg.dryRun,
 		Progress:       isTTY && !cfg.quiet,
 		Transport: transport.Options{
+			Direct:     cfg.direct,
 			SSH:        sshFields[0],
 			SSHArgs:    sshFields[1:],
 			FastCipher: !cfg.noFastCipher,

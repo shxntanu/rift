@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/shxntanu/rift/internal/direct"
 	"github.com/shxntanu/rift/internal/proto"
 )
 
@@ -48,6 +49,7 @@ func (e Endpoint) String() string {
 
 // Options configure how server processes are started.
 type Options struct {
+	Direct     bool     // opt-in SSH-bootstrapped encrypted TCP
 	SSH        string   // ssh binary
 	SSHArgs    []string // extra args inserted before the host
 	FastCipher bool     // prefer AES-GCM, which is hardware accelerated on most CPUs
@@ -64,8 +66,13 @@ type Dialer struct {
 	ep  Endpoint
 	opt Options
 
-	deployMu sync.Mutex
-	deployed bool
+	localSSH, remoteSSH string
+	sshWindow           int64
+	deployMu            sync.Mutex
+	deployed            bool
+	directAddr          string
+	directOffer         direct.Offer
+	control             *Conn
 
 	// WireOut / WireIn count raw bytes crossing the transport.
 	WireOut atomic.Int64
@@ -80,8 +87,9 @@ func NewDialer(ep Endpoint, opt Options) *Dialer {
 	return &Dialer{ep: ep, opt: opt}
 }
 
-// Conn is a running server process speaking the protocol over stdio.
+// Conn carries the protocol over a server process or an encrypted TCP stream.
 type Conn struct {
+	stop   func() bool
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
@@ -93,22 +101,38 @@ type Conn struct {
 
 func (c *Conn) Read(p []byte) (int, error) {
 	n, err := c.stdout.Read(p)
-	c.d.WireIn.Add(int64(n))
+	if c.cmd != nil {
+		c.d.WireIn.Add(int64(n))
+	}
 	return n, err
 }
 
 func (c *Conn) Write(p []byte) (int, error) {
 	n, err := c.stdin.Write(p)
-	c.d.WireOut.Add(int64(n))
+	if c.cmd != nil {
+		c.d.WireOut.Add(int64(n))
+	}
 	return n, err
 }
 
 // CloseWrite signals EOF to the server.
-func (c *Conn) CloseWrite() error { return c.stdin.Close() }
+func (c *Conn) CloseWrite() error {
+	if cw, ok := c.stdin.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return c.stdin.Close()
+}
 
 // Close signals EOF to the server and waits briefly for it to exit.
 func (c *Conn) Close() error {
 	c.once.Do(func() {
+		if c.cmd == nil {
+			if c.stop != nil {
+				c.stop()
+			}
+			c.err = c.stdout.Close()
+			return
+		}
 		_ = c.stdin.Close()
 		done := make(chan error, 1)
 		go func() { done <- c.cmd.Wait() }()
@@ -182,6 +206,14 @@ var ErrNeedDeploy = errors.New("rift is not installed on the remote")
 // Dial starts a server process. The primary connection (worker=false) may
 // prompt for credentials and deploys the binary if needed.
 func (d *Dialer) Dial(ctx context.Context, worker bool, idx int) (*Conn, error) {
+	if worker && d.directAddr != "" {
+		if c, err := d.dialDirect(ctx, idx); err == nil {
+			return c, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
 	c, need, err := d.start(ctx, worker, idx)
 	if err != nil {
 		return nil, err
@@ -205,7 +237,7 @@ func (d *Dialer) Dial(ctx context.Context, worker bool, idx int) (*Conn, error) 
 	return c, nil
 }
 
-func (d *Dialer) command(ctx context.Context, worker bool, idx int) (*exec.Cmd, error) {
+func (d *Dialer) command(ctx context.Context, worker bool, idx int, debugFile string) (*exec.Cmd, error) {
 	if d.ep.Host == "" {
 		self, err := os.Executable()
 		if err != nil {
@@ -214,14 +246,26 @@ func (d *Dialer) command(ctx context.Context, worker bool, idx int) (*exec.Cmd, 
 		return exec.CommandContext(ctx, self, "serve"), nil
 	}
 	script := fmt.Sprintf(`p="%s"; if [ -x "$p" ]; then exec "$p" serve; fi; echo "RIFT-NEED $(uname -s) $(uname -m)"`, d.remoteBin())
-	args := append(d.sshArgs(worker, idx), d.ep.Host, "sh -c '"+script+"'")
+	args := d.sshArgs(worker, idx)
+	if debugFile != "" {
+		args = append(args, "-vv", "-E", debugFile)
+	}
+	args = append(args, d.ep.Host, "sh -c '"+script+"'")
 	return exec.CommandContext(ctx, d.opt.SSH, args...), nil
 }
 
 // start launches the process and reads the server magic. If the remote
 // lacks the binary it returns the reported "OS ARCH" in need.
 func (d *Dialer) start(ctx context.Context, worker bool, idx int) (*Conn, string, error) {
-	cmd, err := d.command(ctx, worker, idx)
+	debugFile := ""
+	if !worker && d.ep.Host != "" {
+		if f, err := os.CreateTemp("", "rift-ssh-*.log"); err == nil {
+			debugFile = f.Name()
+			_ = f.Close()
+			defer func() { _ = os.Remove(debugFile) }()
+		}
+	}
+	cmd, err := d.command(ctx, worker, idx, debugFile)
 	if err != nil {
 		return nil, "", err
 	}
@@ -251,6 +295,9 @@ func (d *Dialer) start(ctx context.Context, worker bool, idx int) (*Conn, string
 	if _, err := io.ReadFull(stdout, magic[:]); err != nil {
 		_ = c.Close()
 		msg := c.Stderr()
+		if msg == "" && debugFile != "" {
+			msg = sshFailure(debugFile)
+		}
 		if msg != "" {
 			return nil, "", fmt.Errorf("connect to %s: %s", d.ep, msg)
 		}
@@ -258,6 +305,9 @@ func (d *Dialer) start(ctx context.Context, worker bool, idx int) (*Conn, string
 	}
 	switch string(magic[:]) {
 	case proto.Magic:
+		if debugFile != "" {
+			d.readSSHInfo(debugFile)
+		}
 		return c, "", nil
 	case "RIFT-":
 		line, _ := bufio.NewReader(stdout).ReadString('\n')

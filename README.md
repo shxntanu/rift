@@ -74,7 +74,14 @@ the content matches, only the mtime is fixed and no data is sent. Files too
 big to hash cheaply go through the delta path, which notices identical
 content the same way.
 
-**Connections.** rift opens up to 8 SSH sessions (`-j`). Each is a real,
+**Connections.** rift sizes its connection pool from the planned work and the
+hello round-trip time, up to 32 sessions (`-j` sets the maximum). Low-latency
+syncs retain an eight-session ceiling. The bandwidth-delay estimate targets
+1 GiB/s; this is a sizing heuristic, not a bandwidth measurement. SSH debug
+diagnostics supply the receiving channel's advertised window and both SSH
+version strings when available. Otherwise rift assumes the upstream 2 MiB
+window, or skips fixed-window scaling for identified HPN builds. `RIFT_DEBUG=1`
+shows the measurement and whether the window was observed or assumed. Each is a real,
 separate TCP connection with its own `ssh` process, so encryption spreads
 across cores and every connection gets its own congestion window. Extra
 connections are opened only when the plan calls for them; a one-file change
@@ -82,7 +89,13 @@ uses one. Each connection keeps its own ControlMaster socket alive for 15
 minutes, so the next sync skips the SSH handshake. rift also asks SSH for
 AES-GCM, which is hardware-accelerated on any recent CPU.
 
-**Scheduling.** Small files (up to 1 MiB) travel as a single message carrying
+**Scheduling.** A pool of 24 readers opens and reads small files ahead of the
+connection workers, in scheduler priority order. A 64 MiB reservation budget
+covers queued and in-flight contents, with a separate 1,024-file bound for tiny
+files. Connection workers frame, compress and write those buffers. Large-file
+range reads use two buffers to overlap disk reads with compression and writes.
+
+Small files (up to 1 MiB) travel as a single message carrying
 path, mode, mtime and contents. They are sent in batches, and the server
 writes new files in place with their final permissions. Large files are
 queued largest first and cut into 1 MiB ranges, which any connection can
@@ -90,6 +103,13 @@ write straight into a shared temp file on the server. When the queues run
 dry, an idle connection steals the back half of the biggest file still in
 flight. The last large file is therefore finished by all connections
 together, not by whichever one happened to pick it up.
+
+**Applying.** Each server connection has 16 FIFO apply lanes. Paths hash to a
+lane, preserving same-path order while unrelated files can be written in
+parallel; hash collisions simply serialize. Copied payloads are bounded to
+64 MiB and 256 operations per connection. Directory creation, deletions, reads,
+and sync barriers drain the pool. Delta sequences remain sequential. Metadata
+batches are split into individual path operations.
 
 **Deltas.** For a changed file of at least 128 KiB, the server computes a
 FastCDC signature: chunk lengths and hashes. Chunk boundaries depend on the
@@ -164,12 +184,37 @@ ignored: `-H`, `-A`, `-X`, `-L`, `-R`, `-b`, `--delete-excluded`,
 rift's own options:
 
 ```
--j, --conns=N           parallel SSH connections (default 8)
+-j, --conns=N           maximum connections, 1-32 (default 32; auto-sized)
+    --direct           experimental AES-GCM TCP data path, with SSH fallback
     --gitignore         send exactly what git would (see below)
     --delta-min=SIZE    smallest file to delta-transfer (default 128K)
     --no-fast-cipher    don't ask SSH for AES-GCM
     --no-persist        don't keep SSH connections open between runs
 ```
+
+### Direct TCP (experimental)
+
+```sh
+rift --direct ./ me@server:/code/project
+```
+
+SSH authenticates the remote and starts a server listening on an ephemeral TCP
+port. It returns the port and a fresh session secret through SSH. Data then
+travels over mutually authenticated AES-256-GCM TCP streams, bypassing the SSH
+channel window and SSH data encryption processes. The original SSH session
+stays open to own the listener; disconnecting it closes the listener and streams.
+Local destinations also support this mode for testing.
+
+If the listener cannot start or the initial TCP probe fails, rift uses the
+existing SSH connection. Failed extra TCP connections try SSH instead. This
+works through SSH host aliases; destinations reachable only through ProxyJump,
+port forwarding or a firewall generally fall back. Failures after a data stream
+starts abort the sync, rather than replaying partially applied operations.
+
+This is a new, opt-in cryptographic protocol. The implementation review, limits,
+and regression checks are in [the direct transport security review](docs/direct-security.md).
+It has not had an independent cryptographic audit. Keep the default SSH data
+path where that assurance is required.
 
 ### Filters
 

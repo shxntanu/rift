@@ -12,12 +12,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/klauspost/compress/zstd"
 )
 
 // Version is bumped whenever the wire format changes incompatibly.
-const Version = 1
+const Version = 2
 
 // Magic is written raw by the server as the very first bytes of a session.
 const Magic = "RIFT!"
@@ -33,8 +34,8 @@ type Type uint8
 
 // Message types. C→S are sent by the client, S→C by the server.
 const (
-	THello       Type = iota + 1 // C→S version, session, root, compression level
-	THelloOK                     // S→C version, goos, goarch, absolute root
+	THello       Type = iota + 1 // C→S version, session, root, compression level, direct flag
+	THelloOK                     // S→C version, goos, goarch, absolute root, direct port, optional key
 	TScan                        // C→S exclude patterns
 	TScanEntries                 // S→C batch of entries
 	TScanDone                    // S→C entry count
@@ -78,16 +79,17 @@ const (
 )
 
 // Conn is a framed, optionally compressed, bidirectional message stream.
-// Send/Flush and Recv may be used from two different goroutines, but each
-// side must only be used by one goroutine at a time.
+// Send and Flush serialize concurrent writers. Recv has a single owner.
+// Compression setup and shutdown require all writers to have stopped.
 type Conn struct {
-	raw io.ReadWriteCloser
-	bw  *bufio.Writer
-	zw  *zstd.Encoder
-	w   io.Writer
-	br  *bufio.Reader
-	zr  *zstd.Decoder
-	r   io.Reader
+	writeMu sync.Mutex
+	raw     io.ReadWriteCloser
+	bw      *bufio.Writer
+	zw      *zstd.Encoder
+	w       io.Writer
+	br      *bufio.Reader
+	zr      *zstd.Decoder
+	r       io.Reader
 
 	hdr  [5]byte
 	rhdr [5]byte
@@ -132,6 +134,8 @@ func (c *Conn) EnableCompression(level int) error {
 
 // Send writes one frame whose payload is the concatenation of parts.
 func (c *Conn) Send(t Type, parts ...[]byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	n := 0
 	for _, p := range parts {
 		n += len(p)
@@ -154,6 +158,8 @@ func (c *Conn) Send(t Type, parts ...[]byte) error {
 
 // Flush pushes all buffered frames to the peer.
 func (c *Conn) Flush() error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	if c.zw != nil {
 		if err := c.zw.Flush(); err != nil {
 			return err

@@ -21,6 +21,7 @@ const (
 )
 
 type job struct {
+	read  *smallRead
 	kind  jobKind
 	f     *fileTask
 	rt    *rangeTask
@@ -106,7 +107,10 @@ type scheduler struct {
 	closed  bool
 	abortCh chan struct{}
 
-	steals int
+	readQ     chan job
+	readBytes int64
+	readCount int
+	steals    int
 }
 
 func newScheduler() *scheduler {
@@ -190,6 +194,7 @@ func (s *scheduler) push(urgent, big, small []job, pendingDelta int) {
 	s.big = append(s.big, big...)
 	s.small = append(s.small, small...)
 	s.pending += pendingDelta
+	s.prefetchLocked()
 	s.cond.Broadcast()
 	s.mu.Unlock()
 }
@@ -218,16 +223,19 @@ func (s *scheduler) next(w int, out []job, flush func() error) ([]job, error) {
 		if s.err != nil {
 			return nil, s.err
 		}
+		if s.closed {
+			return nil, errClosed
+		}
 		if q := s.own[w]; len(q) > 0 {
 			s.own[w] = q[1:]
 			return append(out, q[0]), nil
 		}
-		if len(s.urgent) > 0 {
+		if len(s.urgent) > 0 && (s.urgent[0].kind != jobPut || s.urgent[0].read != nil) {
 			j := s.urgent[0]
 			s.urgent = s.urgent[1:]
 			return append(out, j), nil
 		}
-		if len(s.big) > 0 {
+		if len(s.big) > 0 && (s.big[0].kind != jobPut || s.big[0].read != nil) {
 			j := s.big[0]
 			s.big = s.big[1:]
 			if j.rt != nil {
@@ -235,10 +243,13 @@ func (s *scheduler) next(w int, out []job, flush func() error) ([]job, error) {
 			}
 			return append(out, j), nil
 		}
-		if len(s.small) > 0 {
+		if len(s.small) > 0 && (s.small[0].kind != jobPut || s.small[0].read != nil) {
 			var bytes int64
 			n := 0
 			for n < len(s.small) && n < batchFiles && bytes < batchBytes {
+				if s.small[n].kind == jobPut && s.small[n].read == nil {
+					break
+				}
 				if f := s.small[n].f; f != nil {
 					bytes += f.e.Size
 				}
@@ -252,9 +263,6 @@ func (s *scheduler) next(w int, out []job, flush func() error) ([]job, error) {
 			s.active[rt] = struct{}{}
 			s.steals++
 			return append(out, job{kind: jobRange, f: rt.f, rt: rt}), nil
-		}
-		if s.closed {
-			return nil, errClosed
 		}
 		if !flushed {
 			flushed = true

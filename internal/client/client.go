@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -95,6 +96,7 @@ type session struct {
 	st     stats
 	files  []*fileTask
 
+	rtt            time.Duration
 	remoteRoot     string
 	remotePlatform string
 
@@ -256,6 +258,9 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	defer func() { _ = s.dialer.Close() }()
+	stopAbort := context.AfterFunc(ctx, func() { s.sched.abort(ctx.Err()) })
+	defer stopAbort()
 
 	filter, err := scan.NewFilter(opt.Rules)
 	if err != nil {
@@ -282,9 +287,10 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 	if err != nil {
 		return nil, err
 	}
-	s.debugf("primary connection ready (%s)", s.remotePlatform)
+	s.debugf("primary connection ready (%s), hello RTT %s", s.remotePlatform, s.rtt.Round(time.Microsecond))
 	s.addConn(ctrl)
 	var spawnWG sync.WaitGroup
+	stopReaders := func() {}
 	// Close connections gracefully (EOF lets servers finish and exit) before
 	// cancelling the context, which would kill processes still dialing.
 	defer func() {
@@ -294,6 +300,7 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 		}
 		s.sched.close()
 		s.sched.waitWorkers()
+		stopReaders()
 		s.debugf("closing %d connections", len(s.liveConns()))
 		var wg sync.WaitGroup
 		for _, rc := range s.liveConns() {
@@ -305,6 +312,7 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 		}
 		wg.Wait()
 		s.debugf("connections closed")
+		_ = s.dialer.Close()
 		cancel()
 		spawnWG.Wait()
 		s.debugf("done")
@@ -396,6 +404,7 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 		}
 	}
 
+	stopReaders = s.startReaders()
 	s.spawnWorkers(ctx, &spawnWG, p)
 	go ctrl.work()
 	if s.pushPlan(p) {
@@ -462,8 +471,9 @@ func (s *session) spawnWorkers(ctx context.Context, wg *sync.WaitGroup, p *plan)
 		bytes += f.e.Size
 	}
 	files := len(p.transfers) + len(p.sigs)
-	want := 1 + int(bytes/(4<<20)) + files/256 + len(p.sigs)/4
-	want = min(want, s.opt.Conns)
+	window, info := s.dialer.ChannelWindow()
+	want := connectionCount(bytes, files, len(p.sigs), s.opt.Conns, s.rtt, window)
+	s.debugf("connections: %d, hello RTT=%s, %s", want, s.rtt.Round(time.Microsecond), info)
 	for i := 1; i < want; i++ {
 		wg.Add(1)
 		go func() {
@@ -481,6 +491,19 @@ func (s *session) spawnWorkers(ctx context.Context, wg *sync.WaitGroup, p *plan)
 			rc.work()
 		}()
 	}
+}
+
+// connectionCount uses a 1 GiB/s target to estimate the bandwidth-delay
+// product. This is a sizing target, not a measured bandwidth claim. Planned
+// work and the user's cap still limit fan-out; low-RTT/local syncs cap at 8.
+func connectionCount(bytes int64, files, sigs, limit int, rtt time.Duration, window int64) int {
+	work := 1 + bytes/(4<<20) + int64(files/256+sigs/4)
+	ceiling := int64(8)
+	if window > 0 && rtt > 0 {
+		bdp := float64(1<<30) * rtt.Seconds()
+		ceiling = max(ceiling, int64(min(32, math.Ceil(bdp/float64(window)))))
+	}
+	return int(max(1, min(work, ceiling, 32, int64(limit))))
 }
 
 func collectScan(rc *rconn, abort <-chan struct{}) ([]scan.Entry, []string, error) {

@@ -1,9 +1,8 @@
 // Package server implements the receiving side of a rift session.
 //
-// A server is deliberately dumb and stateless across connections: every
-// connection gets its own server process, and the client coordinates all of
-// them. This lets the client spread work across many SSH connections and
-// rebalance it freely.
+// Each connection owns its apply and delta state; the client coordinates
+// shared files across connections. SSH launches separate server processes,
+// while the optional direct listener hosts multiple connections in one process.
 package server
 
 import (
@@ -21,6 +20,7 @@ import (
 	"sync"
 
 	"github.com/shxntanu/rift/internal/cdc"
+	"github.com/shxntanu/rift/internal/direct"
 	"github.com/shxntanu/rift/internal/proto"
 	"github.com/shxntanu/rift/internal/scan"
 	"github.com/zeebo/xxh3"
@@ -28,13 +28,16 @@ import (
 )
 
 type server struct {
-	c       *proto.Conn
-	root    string
-	session string
-	enc     proto.Enc
-	ranges  map[uint64]*rangeFile
-	delta   *deltaState
-	buf     []byte
+	listener                *direct.Listener
+	boundRoot, boundSession string
+	raw                     io.ReadWriteCloser
+	c                       *proto.Conn
+	root                    string
+	session                 string
+	enc                     proto.Enc
+	ranges                  map[uint64]*rangeFile
+	delta                   *deltaState
+	buf                     []byte
 }
 
 type rangeFile struct {
@@ -57,31 +60,46 @@ type deltaState struct {
 }
 
 // Serve runs one server session over rw until the client disconnects.
-func Serve(rw io.ReadWriteCloser) error {
+func Serve(rw io.ReadWriteCloser) error { return serve(rw, "", "") }
+
+var setUmask sync.Once
+
+func serve(rw io.ReadWriteCloser, root, session string) error {
 	if _, err := io.WriteString(rw, proto.Magic); err != nil {
 		return err
 	}
 	// Files and directories are created with their final permissions, saving
 	// a chmod per file.
-	unix.Umask(0)
+	setUmask.Do(func() { unix.Umask(0) })
 	s := &server{
+		raw:       rw,
+		boundRoot: root, boundSession: session,
 		c:      proto.NewConn(rw),
 		ranges: map[uint64]*rangeFile{},
 		buf:    make([]byte, proto.ChunkSize),
 	}
+	defer func() { _ = s.c.CloseWrite(); _ = s.c.Close() }()
+	defer func() {
+		if s.listener != nil {
+			_ = s.listener.Close()
+		}
+	}()
 	defer s.cleanup()
 	if err := s.handshake(); err != nil {
 		return err
 	}
+	pool := newApplyPool(s)
+	defer pool.close()
 	for {
 		t, p, err := s.c.Recv()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return nil
+				return pool.drain()
 			}
 			return err
 		}
-		if err := s.handle(t, p); err != nil {
+		if err := pool.handle(s, t, p); err != nil {
+			_ = pool.drain()
 			s.enc.Reset()
 			s.enc.Uvarint(0)
 			s.enc.U8(proto.CodeFatal)
@@ -106,6 +124,7 @@ func (s *server) handshake() error {
 	s.session = d.Str()
 	root := d.Str()
 	level := int(d.Varint())
+	wantDirect := d.U8() == 1
 	if d.Err != nil {
 		return d.Err
 	}
@@ -140,6 +159,9 @@ func (s *server) handshake() error {
 	if err != nil {
 		return fail(err)
 	}
+	if s.boundRoot != "" && (abs != s.boundRoot || s.session != s.boundSession || wantDirect) {
+		return fail(errors.New("direct session does not match SSH authorization"))
+	}
 	if err := os.MkdirAll(abs, 0o755); err != nil {
 		return fail(err)
 	}
@@ -150,6 +172,19 @@ func (s *server) handshake() error {
 	s.enc.Str(runtime.GOOS)
 	s.enc.Str(runtime.GOARCH)
 	s.enc.Str(abs)
+	if wantDirect {
+		// Only the SSH-authorized root and session are valid on this listener.
+		listener, listenErr := direct.Listen(func(c *direct.Conn) { _ = serve(c, s.root, s.session) })
+		if listenErr == nil {
+			s.listener = listener
+		} // A blocked listener falls back to SSH.
+	}
+	if s.listener != nil {
+		s.enc.Uvarint(uint64(s.listener.Offer.Port))
+		s.enc.Bytes(s.listener.Offer.Key[:])
+	} else {
+		s.enc.Uvarint(0)
+	}
 	if err := s.c.Send(proto.THelloOK, s.enc.B); err != nil {
 		return err
 	}
@@ -197,6 +232,9 @@ func (s *server) handle(t proto.Type, p []byte) error {
 		return s.del(&d)
 	case proto.TSync:
 		seq := d.Uvarint()
+		if d.Err != nil {
+			return d.Err
+		}
 		s.enc.Reset()
 		s.enc.Uvarint(seq)
 		if err := s.c.Send(proto.TSyncAck, s.enc.B); err != nil {

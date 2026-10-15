@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/shxntanu/rift/internal/cdc"
+	"github.com/shxntanu/rift/internal/direct"
 	"github.com/shxntanu/rift/internal/proto"
 	"github.com/shxntanu/rift/internal/scan"
 	"github.com/shxntanu/rift/internal/transport"
@@ -67,13 +68,24 @@ func (s *session) connect(ctx context.Context, worker bool, id int) (*rconn, err
 	if err != nil {
 		return nil, err
 	}
+	return s.hello(ctx, tc, id, id == 0 && s.opt.Transport.Direct)
+}
+
+func (s *session) hello(ctx context.Context, tc *transport.Conn, id int, wantDirect bool) (*rconn, error) {
 	pc := proto.NewConn(tc)
 	var enc proto.Enc
 	enc.Uvarint(proto.Version)
 	enc.Str(s.id)
 	enc.Str(s.opt.Dst.Path)
 	enc.Varint(int64(s.opt.Compress))
-	if err := pc.Send(proto.THello, enc.B); err == nil {
+	if wantDirect {
+		enc.U8(1)
+	} else {
+		enc.U8(0)
+	}
+	started := time.Now()
+	var err error
+	if err = pc.Send(proto.THello, enc.B); err == nil {
 		err = pc.Flush()
 	}
 	if err != nil {
@@ -85,6 +97,7 @@ func (s *session) connect(ctx context.Context, worker bool, id int) (*rconn, err
 		_ = tc.Close()
 		return nil, fmt.Errorf("handshake: %w", err)
 	}
+	rtt := time.Since(started)
 	d := proto.Dec{B: p}
 	switch t {
 	case proto.THelloOK:
@@ -97,21 +110,48 @@ func (s *session) connect(ctx context.Context, worker bool, id int) (*rconn, err
 		_ = tc.Close()
 		return nil, fmt.Errorf("handshake: unexpected message %d", t)
 	}
-	d.Uvarint()
+	version := d.Uvarint()
+	if version != proto.Version {
+		_ = tc.Close()
+		return nil, fmt.Errorf("server protocol version %d", version)
+	}
 	goos, goarch, root := d.Str(), d.Str(), d.Str()
+	port := d.Uvarint()
+	var offer direct.Offer
+	if port != 0 {
+		key := d.BytesRef()
+		if port > 65535 || len(key) != len(offer.Key) {
+			_ = tc.Close()
+			return nil, errors.New("invalid direct offer")
+		}
+		offer.Port = uint16(port)
+		copy(offer.Key[:], key)
+	}
 	if d.Err != nil {
 		_ = tc.Close()
 		return nil, d.Err
+	}
+	if id == 0 {
+		s.rtt = rtt
+		s.remoteRoot = root
+		s.remotePlatform = goos + "/" + goarch
+	}
+	if wantDirect && offer.Port != 0 {
+		data, directErr := s.dialer.UseDirect(ctx, tc, offer)
+		if directErr == nil {
+			s.debugf("direct TCP connected")
+			// Use the SSH-resolved absolute path for the bound direct session.
+			s.opt.Dst.Path = root
+			return s.hello(ctx, data, id, false)
+		}
+		s.logf("direct TCP unavailable (%v); using SSH", directErr)
+		s.debugf("direct TCP unavailable (%v); using SSH", directErr)
 	}
 	if s.opt.Compress > 0 {
 		if err := pc.EnableCompression(s.opt.Compress); err != nil {
 			_ = tc.Close()
 			return nil, err
 		}
-	}
-	if id == 0 {
-		s.remoteRoot = root
-		s.remotePlatform = goos + "/" + goarch
 	}
 	rc := &rconn{
 		id:     id,
@@ -140,6 +180,8 @@ func (rc *rconn) close() {
 		select {
 		case <-rc.dead:
 		case <-time.After(5 * time.Second):
+			_ = rc.tc.Close() // unblock Recv before releasing its decoder
+			<-rc.dead
 		}
 		_ = rc.pc.Close()
 	})
@@ -288,7 +330,7 @@ func (rc *rconn) work() {
 func (rc *rconn) do(j *job) error {
 	switch j.kind {
 	case jobPut:
-		return rc.put(j.f)
+		return rc.put(j)
 	case jobSymlink:
 		f := j.f
 		rc.enc.Reset()
@@ -328,9 +370,17 @@ func (rc *rconn) do(j *job) error {
 	return fmt.Errorf("unknown job kind %d", j.kind)
 }
 
-func (rc *rconn) put(f *fileTask) error {
-	s := rc.s
-	data, err := readSmall(s.localPath(f.e.Path), rc.buf[:f.e.Size])
+func (rc *rconn) put(j *job) error {
+	s, f := rc.s, j.f
+	r := j.read
+	defer s.sched.releaseRead(r)
+	select {
+	case <-r.done:
+	case <-s.sched.abortCh:
+		<-r.done
+		return s.sched.failed()
+	}
+	data, err := r.data, r.err
 	if err != nil {
 		s.recordErr(fmt.Sprintf("%s: %v", f.e.Path, err))
 		s.st.bytesDone.Add(f.e.Size)
@@ -402,37 +452,67 @@ func (rc *rconn) sendRange(rt *rangeTask) error {
 		s.rangeProgress(f, drained)
 		return nil
 	}
-	if rt.pos == 0 {
-		s.logf(">f %s", f.e.Path)
+	// Two buffers overlap ReadAt with compression and network writes. The
+	// producer is joined before this connection can reuse/close its file.
+	type chunk struct {
+		buf []byte
+		off int64
+		err error
 	}
-	for {
-		off, n := rt.claim(proto.ChunkSize)
-		if n == 0 {
-			break
-		}
-		buf := rc.buf[:n]
-		k, err := fh.ReadAt(buf, off)
-		if int64(k) < n {
-			// The file shrank or failed mid-transfer: still send the claimed
-			// length so byte accounting completes, but never finalize it.
-			clear(buf[k:])
-			if !f.failed.Swap(true) {
+	free := make(chan []byte, 2)
+	free <- rc.buf
+	free <- make([]byte, proto.ChunkSize)
+	ready := make(chan chunk, 2)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer close(ready)
+		for {
+			var buf []byte
+			select {
+			case buf = <-free:
+			case <-stop:
+				return
+			}
+			off, n := rt.claim(proto.ChunkSize)
+			if n == 0 {
+				return
+			}
+			buf = buf[:n]
+			k, err := fh.ReadAt(buf, off)
+			if int64(k) < n {
+				clear(buf[k:])
 				if err == nil || errors.Is(err, io.EOF) {
 					err = errors.New("file changed during transfer")
 				}
-				s.recordErr(fmt.Sprintf("%s: %v", f.e.Path, err))
 			}
+			select {
+			case ready <- chunk{buf, off, err}:
+			case <-stop:
+				return
+			}
+		}
+	}()
+	defer func() { close(stop); <-done }()
+	for ch := range ready {
+		if ch.off == 0 {
+			s.logf(">f %s", f.e.Path)
+		}
+		if ch.err != nil && !f.failed.Swap(true) {
+			s.recordErr(fmt.Sprintf("%s: %v", f.e.Path, ch.err))
 		}
 		rc.enc.Reset()
 		rc.enc.Uvarint(f.id)
 		rc.enc.Str(f.e.Path)
 		rc.enc.Uvarint(uint64(f.e.Size))
-		rc.enc.Uvarint(uint64(off))
-		if err := rc.pc.Send(proto.TRangeWrite, rc.enc.B, buf); err != nil {
+		rc.enc.Uvarint(uint64(ch.off))
+		if err := rc.pc.Send(proto.TRangeWrite, rc.enc.B, ch.buf); err != nil {
 			return err
 		}
-		s.st.bytesDone.Add(n)
-		s.st.literal.Add(n)
+		s.st.bytesDone.Add(int64(len(ch.buf)))
+		s.st.literal.Add(int64(len(ch.buf)))
+		free <- ch.buf[:cap(ch.buf)]
 	}
 	rc.enc.Reset()
 	rc.enc.Uvarint(f.id)

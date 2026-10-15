@@ -25,6 +25,7 @@ type config struct {
 	gitignore      bool
 	noFastCipher   bool
 	noPersist      bool
+	direct         bool
 	modifyWindow   int64
 	deltaMin       int64
 	rules          []string
@@ -152,6 +153,7 @@ var longOpts = map[string]option{
 	"bwlimit":             unsupported(optArg),
 
 	// rift extensions
+	"direct":         flag(func(c *config) { c.direct = true }),
 	"conns":          intArg(func(c *config) *int { return &c.conns }),
 	"gitignore":      flag(func(c *config) { c.gitignore = true }),
 	"no-fast-cipher": flag(func(c *config) { c.noFastCipher = true }),
@@ -174,7 +176,7 @@ var shortOpts = map[byte]string{
 }
 
 func parseArgs(args []string) (*config, error) {
-	c := &config{conns: 8, compress: 1, deltaMin: 128 << 10, ssh: "ssh"}
+	c := &config{conns: 32, compress: 1, deltaMin: 128 << 10, ssh: "ssh"}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
@@ -235,6 +237,9 @@ func parseArgs(args []string) (*config, error) {
 		default:
 			c.pos = append(c.pos, a)
 		}
+	}
+	if c.conns < 1 || c.conns > 32 {
+		return nil, fmt.Errorf("connections must be 1-32")
 	}
 	if c.compress < 0 || c.compress > 4 {
 		return nil, fmt.Errorf("compress level must be 0-4")
