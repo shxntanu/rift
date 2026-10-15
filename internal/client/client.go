@@ -262,7 +262,8 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 		return nil, err
 	}
 
-	// Scan locally while the primary connection is being established.
+	// scan locally while SSH connects, then pipeline the scan
+	// request behind the hello without waiting for its acknowledgement.
 	type localScan struct {
 		res *scan.Result
 		err error
@@ -278,7 +279,23 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 		localCh <- r
 	}()
 
-	ctrl, err := s.connect(ctx, false, 0)
+	var ls localScan
+	ctrl, err := s.connect(ctx, false, 0, func() ([]string, error) {
+		select {
+		case ls = <-localCh:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		if ls.err != nil {
+			return nil, ls.err
+		}
+		remoteSpecs := filter.RemoteScanSpecs(ls.res.Entries)
+		if opt.GitIgnore {
+			remoteSpecs = append([]string{"- /.git"}, remoteSpecs...)
+			remoteSpecs = append(remoteSpecs, ":- .gitignore")
+		}
+		return remoteSpecs, nil
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -310,29 +327,7 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 		s.debugf("done")
 	}()
 
-	// The local scan usually finishes while ssh is still connecting. Its
-	// result lets the remote skip protected trees we have nothing to send to.
-	ls := <-localCh
-	if ls.err != nil {
-		return nil, ls.err
-	}
 	s.debugf("local scan: %d entries", len(ls.res.Entries))
-	remoteSpecs := filter.RemoteScanSpecs(ls.res.Entries)
-	if opt.GitIgnore {
-		remoteSpecs = append([]string{"- /.git"}, remoteSpecs...)
-		remoteSpecs = append(remoteSpecs, ":- .gitignore")
-	}
-	ctrl.enc.Reset()
-	ctrl.enc.Uvarint(uint64(len(remoteSpecs)))
-	for _, p := range remoteSpecs {
-		ctrl.enc.Str(p)
-	}
-	if err := ctrl.pc.Send(proto.TScan, ctrl.enc.B); err != nil {
-		return nil, err
-	}
-	if err := ctrl.pc.Flush(); err != nil {
-		return nil, err
-	}
 
 	remote, remoteWarn, err := collectScan(ctrl, s.sched.abortCh)
 	if err != nil {
@@ -468,7 +463,7 @@ func (s *session) spawnWorkers(ctx context.Context, wg *sync.WaitGroup, p *plan)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			rc, err := s.connect(ctx, true, i)
+			rc, err := s.connect(ctx, true, i, nil)
 			if err != nil {
 				if ctx.Err() == nil && i == 1 {
 					s.logf("extra connections unavailable (%v); continuing with fewer", err)

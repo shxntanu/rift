@@ -62,10 +62,20 @@ type signature struct {
 	hashes []proto.Hash
 }
 
-func (s *session) connect(ctx context.Context, worker bool, id int) (*rconn, error) {
+// connect pipelines the primary's scan behind its hello. scanSpecs waits for
+// the local scan after dialing, while worker connections pass nil.
+func (s *session) connect(ctx context.Context, worker bool, id int, scanSpecs func() ([]string, error)) (*rconn, error) {
 	tc, err := s.dialer.Dial(ctx, worker, id)
 	if err != nil {
 		return nil, err
+	}
+	var specs []string
+	if scanSpecs != nil {
+		specs, err = scanSpecs()
+		if err != nil {
+			_ = tc.Close()
+			return nil, err
+		}
 	}
 	pc := proto.NewConn(tc)
 	var enc proto.Enc
@@ -73,16 +83,42 @@ func (s *session) connect(ctx context.Context, worker bool, id int) (*rconn, err
 	enc.Str(s.id)
 	enc.Str(s.opt.Dst.Path)
 	enc.Varint(int64(s.opt.Compress))
-	if err := pc.Send(proto.THello, enc.B); err == nil {
-		err = pc.Flush()
-	}
-	if err != nil {
+	// keep the raw hello buffered while switching the write
+	// half, then send the scan in the same flush without waiting for hello OK.
+	if err := pc.Send(proto.THello, enc.B); err != nil {
 		_ = tc.Close()
 		return nil, fmt.Errorf("handshake: %w", err)
 	}
+	if s.opt.Compress > 0 {
+		if err := pc.EnableWriteCompression(s.opt.Compress); err != nil {
+			_ = pc.Close()
+			return nil, err
+		}
+	}
+	if scanSpecs != nil {
+		enc.Reset()
+		enc.Uvarint(uint64(len(specs)))
+		for _, spec := range specs {
+			enc.Str(spec)
+		}
+		if len(enc.B) > proto.MaxFrame {
+			_ = pc.Close()
+			return nil, fmt.Errorf("scan frame too large: %d", len(enc.B))
+		}
+		err = pc.Send(proto.TScan, enc.B)
+	}
+	if err == nil {
+		err = pc.Flush()
+	}
+	writeErr := err
+	// A rejecting server can close its input before the pipelined scan has
+	// finished writing. Read its uncompressed TError even after a write fails.
 	t, p, err := pc.Recv()
 	if err != nil {
-		_ = tc.Close()
+		if writeErr != nil {
+			err = writeErr
+		}
+		_ = pc.Close()
 		return nil, fmt.Errorf("handshake: %w", err)
 	}
 	d := proto.Dec{B: p}
@@ -91,11 +127,19 @@ func (s *session) connect(ctx context.Context, worker bool, id int) (*rconn, err
 	case proto.TError:
 		d.Uvarint()
 		d.U8()
-		_ = tc.Close()
-		return nil, fmt.Errorf("server: %s", d.Str())
+		msg := d.Str()
+		_ = pc.Close()
+		if d.Err != nil {
+			return nil, fmt.Errorf("handshake: %w", d.Err)
+		}
+		return nil, fmt.Errorf("server: %s", msg)
 	default:
-		_ = tc.Close()
+		_ = pc.Close()
 		return nil, fmt.Errorf("handshake: unexpected message %d", t)
+	}
+	if writeErr != nil {
+		_ = tc.Close()
+		return nil, fmt.Errorf("handshake: %w", writeErr)
 	}
 	d.Uvarint()
 	goos, goarch, root := d.Str(), d.Str(), d.Str()
@@ -104,8 +148,10 @@ func (s *session) connect(ctx context.Context, worker bool, id int) (*rconn, err
 		return nil, d.Err
 	}
 	if s.opt.Compress > 0 {
-		if err := pc.EnableCompression(s.opt.Compress); err != nil {
-			_ = tc.Close()
+		// the read half switches only after a raw hello OK;
+		// a rejected hello is always decoded as an uncompressed error above.
+		if err := pc.EnableReadCompression(); err != nil {
+			_ = pc.Close()
 			return nil, err
 		}
 	}
