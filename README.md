@@ -41,18 +41,12 @@ I would just stop it and think of resuming this activity it some other day.
 
 ## Benchmarks
 
-The Go source tree (12,000 files, 156 MB), pushed to a local sshd on an Apple
-Silicon MacBook. Every run is warm: the page cache is hot, and rift reuses its
+Every run is warm: the page cache is hot, and rift reuses its
 persistent SSH connections.
 
-| Scenario                         |   rsync |    rift |       |
-| -------------------------------- | ------: | ------: | ----: |
-| Fresh copy                       | 626.41s | 108.00s |  5.8x |
-| Nothing changed                  |   2.01s |   0.17s | 11.8x |
-| 2,000 files touched (mtime only) |   3.16s |   0.44s |  7.2x |
-| 50 files edited                  |   2.00s |   0.19s | 10.5x |
-| A subtree deleted                |   1.97s |   0.26s |  7.6x |
-| Small edit inside a 381 MB file  |   1.74s |    0.6s |  2.9x |
+| Scenario   |   rsync |    rift |      |
+| ---------- | ------: | ------: | ---: |
+| Fresh copy | 626.41s | 108.00s | 5.8x |
 
 The rsync here is the one that ships with macOS (openrsync). A localhost
 benchmark also hides network latency, which is exactly where rift's design
