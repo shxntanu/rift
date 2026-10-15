@@ -302,30 +302,39 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 	s.debugf("primary connection ready (%s)", s.remotePlatform)
 	s.addConn(ctrl)
 	var spawnWG sync.WaitGroup
-	// Close connections gracefully (EOF lets servers finish and exit) before
-	// cancelling the context, which would kill processes still dialing.
-	defer func() {
-		if s.sched.failed() != nil || ctx.Err() != nil {
-			// Kill the processes so workers blocked on a dead pipe return.
+	var shutdownOnce sync.Once
+	var shutdownErr error
+	// use graceful teardown to confirm the final batch before
+	// building the summary. Keep it deferred as well for early-return cleanup.
+	shutdown := func() error {
+		shutdownOnce.Do(func() {
+			if s.sched.failed() != nil || ctx.Err() != nil {
+				// Kill the processes so workers blocked on a dead pipe return.
+				cancel()
+			}
+			s.sched.close()
+			s.sched.waitWorkers()
+			conns := s.liveConns()
+			s.debugf("closing %d connections", len(conns))
+			var wg sync.WaitGroup
+			closeErrs := make([]error, len(conns))
+			for i, rc := range conns {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					closeErrs[i] = rc.close()
+				}()
+			}
+			wg.Wait()
+			s.debugf("connections closed")
 			cancel()
-		}
-		s.sched.close()
-		s.sched.waitWorkers()
-		s.debugf("closing %d connections", len(s.liveConns()))
-		var wg sync.WaitGroup
-		for _, rc := range s.liveConns() {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				rc.close()
-			}()
-		}
-		wg.Wait()
-		s.debugf("connections closed")
-		cancel()
-		spawnWG.Wait()
-		s.debugf("done")
-	}()
+			spawnWG.Wait()
+			shutdownErr = errors.Join(closeErrs...)
+			s.debugf("done")
+		})
+		return shutdownErr
+	}
+	defer func() { _ = shutdown() }() // Successful runs collect teardown errors below.
 
 	s.debugf("local scan: %d entries", len(ls.res.Entries))
 
@@ -419,7 +428,8 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 		}
 	}
 
-	// Deletions and directory metadata go last, once every file is in place.
+	// send deletes and directory metadata last, and let EOF
+	// confirm this batch during teardown instead of sending a final barrier.
 	if len(p.deletes) > 0 || len(p.dirMetas) > 0 {
 		s.sched.pushOwn(0, job{kind: jobFunc, fn: func(rc *rconn) error {
 			if err := rc.sendDeletes(p.deletes, 0); err != nil {
@@ -430,12 +440,13 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 		if err := s.sched.waitIdle(); err != nil {
 			return nil, err
 		}
-		if err := s.barrier([]*rconn{ctrl}); err != nil {
-			return nil, err
-		}
 	}
 	stopProgress()
 	s.debugf("transfer complete")
+	// Collect errors from the final batch before taking the summary.
+	if err := shutdown(); err != nil {
+		return nil, err
+	}
 
 	s.sched.mu.Lock()
 	sum.Steals = s.sched.steals
