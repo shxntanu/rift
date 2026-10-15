@@ -87,6 +87,32 @@ repository.
 
 ## Install
 
+On Linux or macOS (Intel/AMD and ARM64), install the latest release without Go:
+
+```sh
+curl -fsSL https://github.com/shxntanu/rift/releases/latest/download/install.sh | sh
+```
+
+The installer verifies the bundle's SHA-256 checksum and installs `rift` and its
+four server binaries into `~/.local/bin`. Add that directory to your `PATH` if
+needed. Run the same command to upgrade. It requires `curl`, `tar`, and
+`sha256sum` (Linux) or `shasum` (macOS), and does not need sudo.
+
+To pin a version or choose another directory:
+
+```sh
+curl -fsSL https://github.com/shxntanu/rift/releases/latest/download/install.sh \
+  | RIFT_INSTALL_DIR="$HOME/bin" sh -s -- v0.1.0
+rift --version
+```
+
+You can also download the bundle and `checksums.txt` from
+[GitHub Releases](https://github.com/shxntanu/rift/releases). Each bundle contains
+all four platforms so a client can deploy a matching server to a different
+platform without needing Go. Keep the `rift-<os>-<arch>` files beside `rift`.
+
+### Build from source
+
 You need Go 1.27 or newer to build.
 
 ```sh
@@ -100,6 +126,32 @@ linux/arm64, darwin/amd64 and darwin/arm64. Keep those `rift-<os>-<arch>`
 files next to `rift`, because they are what gets uploaded to a remote. For
 any other platform, rift cross-compiles a server from the source tree when Go
 is available.
+
+### Publish a release
+
+Versions use Semantic Versioning with stable tags such as `v0.1.0`. Bump the
+patch for fixes, minor for features, and major for breaking changes. Protocol
+versions are tracked separately in `internal/proto/proto.go`.
+
+Releases are manual. After merging these changes to `main`, open the repository's
+**Actions → CI and releases → Run workflow**, select `main`, enter a new version
+(for example, `v0.1.0`), and run it. There is no scheduled release or automatic
+release on push. You do not need to create a tag yourself.
+
+GitHub Actions runs vet, race tests, and installer checks on Linux and macOS,
+then cross-compiles static binaries for all four platforms. It creates the
+version tag at the tested commit and publishes a
+GitHub Release with generated release notes, the versioned bundle,
+`checksums.txt`, and `install.sh`. The tag is embedded in `rift --version`;
+all binaries share the commit ID so clients deploy matching servers. No
+additional release secrets are needed beyond the workflow's `GITHUB_TOKEN`.
+The curl command becomes available after the first release is published.
+
+To build the same assets locally without publishing:
+
+```sh
+make release VERSION=v0.1.0  # outputs to dist/
+```
 
 ## Usage
 

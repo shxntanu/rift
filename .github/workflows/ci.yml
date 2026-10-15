@@ -1,0 +1,70 @@
+name: CI and releases
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (for example, v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: sh scripts/test-install.sh
+
+  release:
+    if: github.event_name == 'workflow_dispatch'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Build release bundle
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if git show-ref --verify --quiet "refs/tags/$VERSION" && \
+            [ "$(git rev-list -n 1 "$VERSION")" != "$GITHUB_SHA" ]; then
+            echo "Tag $VERSION already points at a different commit." >&2
+            exit 1
+          fi
+          sh scripts/release.sh "$VERSION"
+      - name: Smoke test release
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          cd dist
+          sha256sum -c checksums.txt
+          tar -xzf "rift_${VERSION}.tar.gz"
+          ./rift-linux-amd64 --version | grep -F "rift $VERSION ("
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          gh release create "$VERSION" \
+            "dist/rift_${VERSION}.tar.gz" dist/checksums.txt dist/install.sh \
+            --target "$GITHUB_SHA" --generate-notes --latest
