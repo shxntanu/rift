@@ -209,7 +209,7 @@ func (b *bench) runScenario(sc scenario) (result, error) {
 			order = []tool{riftTool, rsyncTool}
 		}
 		var line [2]string
-		for _, t := range order {
+		for i, t := range order {
 			d, err := b.sync(t, sc.name)
 			if err != nil {
 				if b.ctx.Err() != nil {
@@ -222,6 +222,9 @@ func (b *bench) runScenario(sc scenario) (result, error) {
 			}
 			res.times[t] = append(res.times[t], d)
 			line[t] = fmtDur(d)
+			if t == riftTool && i+1 < len(order) && order[i+1] == rsyncTool {
+				fmt.Printf("  rift finished in %s; starting rsync...\n", line[t])
+			}
 		}
 		fmt.Printf("  %-26s run %d/%d   rsync %-8s rift %s\n", sc.desc, run+1, b.runs, line[rsyncTool], line[riftTool])
 	}
