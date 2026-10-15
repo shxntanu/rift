@@ -45,7 +45,7 @@ type Options struct {
 	Verbose        bool
 	Progress       bool
 	Transport      transport.Options
-	Log            io.Writer
+	Log            io.Writer `json:"-"`
 }
 
 // Summary describes a completed sync.
@@ -92,6 +92,8 @@ type session struct {
 	id     string
 	src    string
 	dialer *transport.Dialer
+	runner *Runner
+	ctx    context.Context
 	sched  *scheduler
 	st     stats
 	files  []*fileTask
@@ -100,9 +102,10 @@ type session struct {
 	remoteRoot     string
 	remotePlatform string
 
-	connMu sync.Mutex
-	conns  []*rconn
-	seq    atomic.Uint64
+	connMu  sync.Mutex
+	conns   []*rconn
+	seq     atomic.Uint64
+	workers []*workerDial // speculative and selected worker handshakes.
 
 	errMu    sync.Mutex
 	errs     []string
@@ -235,6 +238,10 @@ func newSessionID() string {
 
 // Run performs a sync.
 func Run(ctx context.Context, opt Options) (*Summary, error) {
+	return run(ctx, opt, nil)
+}
+
+func run(ctx context.Context, opt Options, runner *Runner) (*Summary, error) {
 	start := time.Now()
 	if opt.Log == nil {
 		opt.Log = os.Stderr
@@ -256,91 +263,137 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 		start:  start,
 		debug:  os.Getenv("RIFT_DEBUG") != "",
 	}
+	s.runner = runner
+	if runner != nil && !opt.Transport.Direct {
+		s.dialer = runner.dialer
+	}
+	wireOut, wireIn := s.dialer.WireOut.Load(), s.dialer.WireIn.Load()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	defer func() { _ = s.dialer.Close() }()
-	stopAbort := context.AfterFunc(ctx, func() { s.sched.abort(ctx.Err()) })
-	defer stopAbort()
+	if runner == nil || opt.Transport.Direct {
+		defer func() { _ = s.dialer.Close() }()
+	}
+	s.ctx = ctx
+	stopRunner := func() bool { return false }
+	if runner != nil {
+		stopRunner = context.AfterFunc(runner.ctx, cancel)
+	}
+	defer stopRunner()
 
 	filter, err := scan.NewFilter(opt.Rules)
 	if err != nil {
 		return nil, err
 	}
 
-	// Scan locally while the primary connection is being established.
+	// scan locally while SSH connects, then pipeline the scan
+	// request behind the hello without waiting for its acknowledgement.
 	type localScan struct {
 		res *scan.Result
 		err error
 	}
 	localCh := make(chan localScan, 1)
+	localDone := make(chan struct{})
+	defer func() { cancel(); <-localDone }()
 	go func() {
+		defer close(localDone)
 		var r localScan
 		if opt.GitIgnore {
 			r.res, r.err = scan.GitList(ctx, src, filter)
 		} else {
-			r.res, r.err = scan.Walk(ctx, src, scan.Options{Filter: filter})
+			if runner != nil {
+				if runner.cache == nil || runner.src != src {
+					if runner.cache != nil {
+						runner.cache.Close()
+					}
+					runner.cache = scan.NewCache(src)
+					runner.src = src
+				}
+				r.res, r.err = runner.cache.Scan(ctx, filter)
+			} else {
+				r.res, r.err = scan.Walk(ctx, src, scan.Options{Filter: filter})
+			}
 		}
 		localCh <- r
 	}()
 
-	ctrl, err := s.connect(ctx, false, 0)
+	var ls localScan
+	ctrl, err := s.connect(ctx, false, 0, func() ([]string, error) {
+		select {
+		case ls = <-localCh:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		if ls.err != nil {
+			return nil, ls.err
+		}
+		remoteSpecs := filter.RemoteScanSpecs(ls.res.Entries)
+		if opt.GitIgnore {
+			remoteSpecs = append([]string{"- /.git"}, remoteSpecs...)
+			remoteSpecs = append(remoteSpecs, ":- .gitignore")
+		}
+		return remoteSpecs, nil
+	})
 	if err != nil {
 		return nil, err
 	}
 	s.debugf("primary connection ready (%s), hello RTT %s", s.remotePlatform, s.rtt.Round(time.Microsecond))
 	s.addConn(ctrl)
+	stopIO := context.AfterFunc(ctx, func() {
+		for _, rc := range s.liveConns() {
+			_ = rc.tc.CloseRead()
+			_ = rc.tc.CloseWrite()
+		}
+	})
+	defer stopIO()
 	var spawnWG sync.WaitGroup
 	stopReaders := func() {}
-	// Close connections gracefully (EOF lets servers finish and exit) before
-	// cancelling the context, which would kill processes still dialing.
-	defer func() {
-		if s.sched.failed() != nil || ctx.Err() != nil {
-			// Kill the processes so workers blocked on a dead pipe return.
+	var shutdownOnce sync.Once
+	var shutdownErr error
+	// use graceful teardown to confirm the final batch before
+	// building the summary. Keep it deferred as well for early-return cleanup.
+	shutdown := func() error {
+		shutdownOnce.Do(func() {
+			s.stopWarmWorkers()
+			if s.sched.failed() != nil || ctx.Err() != nil {
+				// Kill the processes so workers blocked on a dead pipe return.
+				cancel()
+			}
+			s.sched.close()
+			s.sched.waitWorkers()
+			stopReaders()
+			conns := s.liveConns()
+			s.debugf("closing %d connections", len(conns))
+			var wg sync.WaitGroup
+			closeErrs := make([]error, len(conns))
+			for i, rc := range conns {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					closeErrs[i] = rc.close()
+				}()
+			}
+			wg.Wait()
+			s.debugf("connections closed")
+			if runner == nil || opt.Transport.Direct {
+				_ = s.dialer.Close()
+			}
+			stopIO()
 			cancel()
-		}
-		s.sched.close()
-		s.sched.waitWorkers()
-		stopReaders()
-		s.debugf("closing %d connections", len(s.liveConns()))
-		var wg sync.WaitGroup
-		for _, rc := range s.liveConns() {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				rc.close()
-			}()
-		}
-		wg.Wait()
-		s.debugf("connections closed")
-		_ = s.dialer.Close()
-		cancel()
-		spawnWG.Wait()
-		s.debugf("done")
-	}()
+			spawnWG.Wait()
+			shutdownErr = errors.Join(closeErrs...)
+			if shutdownErr == nil {
+				shutdownErr = s.sched.failed()
+			}
+			s.debugf("done")
+		})
+		return shutdownErr
+	}
+	defer func() { _ = shutdown() }() // Successful runs collect teardown errors below.
 
-	// The local scan usually finishes while ssh is still connecting. Its
-	// result lets the remote skip protected trees we have nothing to send to.
-	ls := <-localCh
-	if ls.err != nil {
-		return nil, ls.err
-	}
 	s.debugf("local scan: %d entries", len(ls.res.Entries))
-	remoteSpecs := filter.RemoteScanSpecs(ls.res.Entries)
-	if opt.GitIgnore {
-		remoteSpecs = append([]string{"- /.git"}, remoteSpecs...)
-		remoteSpecs = append(remoteSpecs, ":- .gitignore")
-	}
-	ctrl.enc.Reset()
-	ctrl.enc.Uvarint(uint64(len(remoteSpecs)))
-	for _, p := range remoteSpecs {
-		ctrl.enc.Str(p)
-	}
-	if err := ctrl.pc.Send(proto.TScan, ctrl.enc.B); err != nil {
-		return nil, err
-	}
-	if err := ctrl.pc.Flush(); err != nil {
-		return nil, err
-	}
+	// overlap worker handshakes with the remote scan; planning
+	// will retain only the connections justified by the actual transfer.
+	s.warmWorkers(ctx, &spawnWG, ls.res.Entries)
 
 	remote, remoteWarn, err := collectScan(ctrl, s.sched.abortCh)
 	if err != nil {
@@ -386,15 +439,15 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 	}
 	defer stopProgress()
 
-	// Conflicting paths and missing directories must exist before any
-	// worker writes files into them.
-	if len(p.conflicts) > 0 || len(p.mkdirs) > 0 {
-		if err := ctrl.sendDeletes(p.conflicts, proto.DeleteRecursive); err != nil {
-			return nil, err
-		}
-		if err := ctrl.sendMkdirs(p.mkdirs); err != nil {
-			return nil, err
-		}
+	if err := ctrl.sendDeletes(p.conflicts, proto.DeleteRecursive); err != nil {
+		return nil, err
+	}
+	if err := ctrl.sendMkdirs(p.mkdirs); err != nil {
+		return nil, err
+	}
+	// workers create missing parents themselves, so only type
+	// conflicts need a directory-creation barrier before workers start.
+	if len(p.conflicts) > 0 {
 		seq := s.seq.Add(1)
 		if err := ctrl.sync(seq); err != nil {
 			return nil, err
@@ -407,6 +460,7 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 	stopReaders = s.startReaders()
 	s.spawnWorkers(ctx, &spawnWG, p)
 	go ctrl.work()
+	finalBatchFolded := false
 	if s.pushPlan(p) {
 		// Barriers make every server confirm it applied everything; delta
 		// failures reported before the ack queue full resends, so repeat.
@@ -414,17 +468,39 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 			if err := s.sched.waitIdle(); err != nil {
 				return nil, err
 			}
+			// One stream orders file writes before directory times. With several
+			// streams, wait for their acknowledgements before setting final times.
+			finalBatchFolded = runner != nil && len(s.liveConns()) == 1
+			if finalBatchFolded {
+				s.sched.pushOwn(0, job{kind: jobFunc, fn: func(rc *rconn) error {
+					if err := rc.sendDeletes(p.deletes, 0); err != nil {
+						return err
+					}
+					return rc.sendMeta(p.dirMetas)
+				}})
+			}
 			if err := s.barrier(s.liveConns()); err != nil {
 				return nil, err
 			}
-			if !s.sched.hasWork() {
+			// An error before an ack can start a resend on another worker.
+			// Wait for it, then repeat only if frames remain unconfirmed;
+			// counting a barrier worker still returning would add an RTT.
+			if err := s.sched.waitIdle(); err != nil {
+				return nil, err
+			}
+			pending := false
+			for _, rc := range s.liveConns() {
+				pending = pending || rc.unconfirmed()
+			}
+			if !pending {
 				break
 			}
 		}
 	}
 
-	// Deletions and directory metadata go last, once every file is in place.
-	if len(p.deletes) > 0 || len(p.dirMetas) > 0 {
+	// Send the remaining deletes and directory times after all file writes.
+	// Teardown confirms them with EOF or a barrier on persistent streams.
+	if !finalBatchFolded && (len(p.deletes) > 0 || len(p.dirMetas) > 0) {
 		s.sched.pushOwn(0, job{kind: jobFunc, fn: func(rc *rconn) error {
 			if err := rc.sendDeletes(p.deletes, 0); err != nil {
 				return err
@@ -434,12 +510,13 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 		if err := s.sched.waitIdle(); err != nil {
 			return nil, err
 		}
-		if err := s.barrier([]*rconn{ctrl}); err != nil {
-			return nil, err
-		}
 	}
 	stopProgress()
 	s.debugf("transfer complete")
+	// Collect errors from the final batch before taking the summary.
+	if err := shutdown(); err != nil {
+		return nil, err
+	}
 
 	s.sched.mu.Lock()
 	sum.Steals = s.sched.steals
@@ -450,8 +527,8 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 	sum.Bytes = s.st.bytesTotal.Load()
 	sum.Literal = s.st.literal.Load()
 	sum.Matched = s.st.matched.Load()
-	sum.WireOut = s.dialer.WireOut.Load()
-	sum.WireIn = s.dialer.WireIn.Load()
+	sum.WireOut = s.dialer.WireOut.Load() - wireOut
+	sum.WireIn = s.dialer.WireIn.Load() - wireIn
 	s.errMu.Lock()
 	sum.Errors = s.errs
 	sum.ErrorCount = s.errCount
@@ -460,9 +537,55 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 	return sum, nil
 }
 
-// spawnWorkers opens extra connections sized to the planned work. They join
-// the pool whenever they are ready; work stealing rebalances around them, so
-// nothing waits for slow handshakes. Small syncs use the primary only.
+// keep speculative connections out of the active pool until
+// planning confirms it is useful. Only the Run goroutine chooses workers.
+type workerDial struct {
+	use     chan struct{}
+	cancel  context.CancelFunc
+	adopted bool
+}
+
+// use the existing 4 MiB/256-file sizing for both warming
+// and the actual plan; only planned deltas get the extra worker allowance.
+func (s *session) workerCount(bytes int64, files, deltas int) int {
+	var window int64
+	if s.dialer != nil {
+		window, _ = s.dialer.ChannelWindow()
+	}
+	return connectionCount(bytes, files, deltas, s.opt.Conns, s.rtt, window)
+}
+
+// overlap worker handshakes with the remote scan. Local file
+// sizes estimate useful parallelism; planning discards unnecessary attempts.
+func (s *session) warmWorkers(ctx context.Context, wg *sync.WaitGroup, entries []scan.Entry) {
+	if s.opt.DryRun {
+		return
+	}
+	var bytes int64
+	var files int
+	for _, e := range entries {
+		if e.Kind == scan.KindFile {
+			bytes += e.Size
+			files++
+		}
+	}
+	for i := 1; i < s.workerCount(bytes, files, 0); i++ {
+		s.workers = append(s.workers, s.dialWorker(ctx, wg, i))
+	}
+}
+
+// cancel unused handshakes, including on an early return.
+// Adopted workers stay alive for graceful teardown after their final ack.
+func (s *session) stopWarmWorkers() {
+	for _, w := range s.workers {
+		if !w.adopted {
+			w.cancel()
+		}
+	}
+}
+
+// select warmed connections and fill any remaining slots.
+// Workers join as their handshakes finish, so transfers never wait on them.
 func (s *session) spawnWorkers(ctx context.Context, wg *sync.WaitGroup, p *plan) {
 	// Delta files mostly send copy instructions, so they count as files,
 	// not bytes.
@@ -471,26 +594,66 @@ func (s *session) spawnWorkers(ctx context.Context, wg *sync.WaitGroup, p *plan)
 		bytes += f.e.Size
 	}
 	files := len(p.transfers) + len(p.sigs)
-	window, info := s.dialer.ChannelWindow()
-	want := connectionCount(bytes, files, len(p.sigs), s.opt.Conns, s.rtt, window)
+	want := s.workerCount(bytes, files, len(p.sigs))
+	_, info := s.dialer.ChannelWindow()
 	s.debugf("connections: %d, hello RTT=%s, %s", want, s.rtt.Round(time.Microsecond), info)
 	for i := 1; i < want; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			rc, err := s.connect(ctx, true, i)
-			if err != nil {
-				if ctx.Err() == nil && i == 1 {
-					s.logf("extra connections unavailable (%v); continuing with fewer", err)
-				}
-				return
-			}
-			defer rc.close()
-			s.addConn(rc)
-			s.debugf("connection %d ready", i)
-			rc.work()
-		}()
+		if i > len(s.workers) {
+			s.workers = append(s.workers, s.dialWorker(ctx, wg, i))
+		}
+		w := s.workers[i-1]
+		w.adopted = true
+		close(w.use)
 	}
+	s.stopWarmWorkers()
+}
+
+func (s *session) dialWorker(ctx context.Context, wg *sync.WaitGroup, id int) *workerDial {
+	ctx, cancel := context.WithCancel(ctx)
+	w := &workerDial{use: make(chan struct{}), cancel: cancel}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer cancel()
+		rc, err := s.connect(ctx, true, id, nil)
+		if rc != nil {
+			defer func() {
+				// Optimization 5: discarded attempts are optional; teardown
+				// collects the stored close error for every adopted connection.
+				_ = rc.close()
+			}()
+		}
+		select {
+		case <-w.use:
+		case <-ctx.Done():
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			if id == 1 {
+				s.logf("extra connections unavailable (%v); continuing with fewer", err)
+			}
+			return
+		}
+		// join before publishing this connection. Shutdown
+		// closes admission and waits for every joined worker before its snapshot.
+		if !s.sched.join() {
+			return
+		}
+		rc.dispatchMu.Lock()
+		rc.optional.Store(false)
+		if rc.rerr != nil {
+			s.sched.abort(rc.rerr)
+		}
+		rc.dispatchMu.Unlock()
+		rc.startRead()
+		s.addConn(rc)
+		s.debugf("connection %d ready", id)
+		rc.workJoined()
+	}()
+	return w
 }
 
 // connectionCount uses a 1 GiB/s target to estimate the bandwidth-delay
@@ -586,6 +749,7 @@ func (s *session) plan(ctx context.Context, ctrl *rconn, lres *scan.Result, remo
 		lmap[local[i].Path] = &local[i]
 	}
 	touched := map[string]bool{}
+	conflicts := map[string]bool{}
 	touch := func(rel string) {
 		touched[parentOf(rel)] = true
 	}
@@ -605,6 +769,7 @@ func (s *session) plan(ctx context.Context, ctrl *rconn, lres *scan.Result, remo
 		r := rmap[l.Path]
 		if r != nil && r.Kind != l.Kind && l.Path != "" {
 			p.conflicts = append(p.conflicts, l.Path)
+			conflicts[l.Path] = true
 			touch(l.Path)
 			r = nil
 		}
@@ -668,6 +833,11 @@ func (s *session) plan(ctx context.Context, ctrl *rconn, lres *scan.Result, remo
 			if _, ok := lmap[r.Path]; ok {
 				continue
 			}
+			// The conflict barrier already deleted these descendants. The
+			// final batch must not delete through their replacement file/link.
+			if hasAncestor(r.Path, conflicts) {
+				continue
+			}
 			if filter.Protected(r.Path, r.Kind == scan.KindDir, lres.CtxFor(r.Path)) {
 				continue
 			}
@@ -687,7 +857,7 @@ func (s *session) plan(ctx context.Context, ctrl *rconn, lres *scan.Result, remo
 			}
 			kept := extra[:0]
 			for _, e := range extra {
-				if !ignored[e] && !ignoredAncestor(e, ignored) {
+				if !ignored[e] && !hasAncestor(e, ignored) {
 					kept = append(kept, e)
 				}
 			}
@@ -718,9 +888,9 @@ func (s *session) plan(ctx context.Context, ctrl *rconn, lres *scan.Result, remo
 	return p, nil
 }
 
-func ignoredAncestor(p string, ignored map[string]bool) bool {
+func hasAncestor(p string, paths map[string]bool) bool {
 	for d := path.Dir(p); d != "." && d != "/"; d = path.Dir(d) {
-		if ignored[d] {
+		if paths[d] {
 			return true
 		}
 	}
@@ -747,7 +917,9 @@ func (s *session) compareHashes(ctx context.Context, ctrl *rconn, cands []*scan.
 		for _, c := range cands[i:end] {
 			ctrl.enc.Str(c.Path)
 		}
-		if err := ctrl.pc.Send(proto.THashReq, ctrl.enc.B); err != nil {
+		// Optimization 2: hash replies confirm these frames too, so a
+		// checksum-only no-op can skip waiting for server exit.
+		if err := ctrl.send(proto.THashReq, ctrl.enc.B); err != nil {
 			return nil, err
 		}
 		nreq++

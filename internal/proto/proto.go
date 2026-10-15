@@ -18,7 +18,7 @@ import (
 )
 
 // Version is bumped whenever the wire format changes incompatibly.
-const Version = 2
+const Version = 3
 
 // Magic is written raw by the server as the very first bytes of a session.
 const Magic = "RIFT!"
@@ -59,6 +59,7 @@ const (
 	TSync                        // C→S barrier
 	TSyncAck                     // S→C barrier reply
 	TError                       // S→C error report
+	TNewSession                  // C→S session id, root; compression stays negotiated
 )
 
 // Error codes carried by TError.
@@ -108,10 +109,11 @@ func NewConn(raw io.ReadWriteCloser) *Conn {
 	return c
 }
 
-// EnableCompression switches both directions to zstd at the given level
-// (1=fastest .. 4=best). It must be called at the same frame boundary on
-// both peers, with no unflushed outgoing data.
-func (c *Conn) EnableCompression(level int) error {
+// EnableWriteCompression switches outgoing frames to zstd at the given level
+// (1=fastest .. 4=best). Previously buffered frames remain uncompressed, so the
+// compression boundary does not require a flush.
+// A raw hello and a compressed scan can share one flush.
+func (c *Conn) EnableWriteCompression(level int) error {
 	zw, err := zstd.NewWriter(c.bw,
 		zstd.WithEncoderLevel(zstd.EncoderLevel(level)),
 		zstd.WithEncoderConcurrency(1),
@@ -120,6 +122,14 @@ func (c *Conn) EnableCompression(level int) error {
 	if err != nil {
 		return fmt.Errorf("zstd writer: %w", err)
 	}
+	c.zw, c.w = zw, zw
+	return nil
+}
+
+// EnableReadCompression switches incoming frames to zstd. Call it after
+// receiving the peer's last uncompressed frame; buffered bytes are preserved.
+// Receive the raw hello reply before switching this half.
+func (c *Conn) EnableReadCompression() error {
 	zr, err := zstd.NewReader(c.br,
 		zstd.WithDecoderConcurrency(1),
 		zstd.WithDecoderMaxWindow(1<<26),
@@ -127,9 +137,17 @@ func (c *Conn) EnableCompression(level int) error {
 	if err != nil {
 		return fmt.Errorf("zstd reader: %w", err)
 	}
-	c.zw, c.zr = zw, zr
-	c.w, c.r = zw, zr
+	c.zr, c.r = zr, zr
 	return nil
+}
+
+// EnableCompression switches both directions to zstd at the given level.
+// Each peer must switch at the corresponding frame boundaries.
+func (c *Conn) EnableCompression(level int) error {
+	if err := c.EnableWriteCompression(level); err != nil {
+		return err
+	}
+	return c.EnableReadCompression()
 }
 
 // Send writes one frame whose payload is the concatenation of parts.

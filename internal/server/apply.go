@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/shxntanu/rift/internal/proto"
+	"github.com/shxntanu/rift/internal/scan"
 )
 
 const applyWorkers = 16
@@ -20,6 +21,7 @@ type applyJob struct {
 // handles and encoder; only the framed response writer is shared.
 type applyPool struct {
 	lanes   [applyWorkers]chan applyJob
+	servers [applyWorkers]*server
 	wg      sync.WaitGroup
 	workers sync.WaitGroup
 	mu      sync.Mutex
@@ -37,6 +39,7 @@ func newApplyPool(s *server) *applyPool {
 		q := make(chan applyJob, 256)
 		p.lanes[i] = q
 		worker := &server{c: s.c, root: s.root, session: s.session, ranges: make(map[uint64]*rangeFile)}
+		p.servers[i] = worker
 		p.workers.Go(func() {
 			defer worker.cleanup()
 			for j := range q {
@@ -131,7 +134,7 @@ func (p *applyPool) handle(s *server, t proto.Type, data []byte) error {
 		for range n {
 			before := d.B
 			path = d.Str()
-			d.U8()
+			kind := scan.Kind(d.U8())
 			d.Uvarint()
 			d.Varint()
 			if d.Err != nil {
@@ -139,6 +142,17 @@ func (p *applyPool) handle(s *server, t proto.Type, data []byte) error {
 			}
 			// Split batches into independent one-entry metadata messages.
 			entry := append([]byte{1}, before[:len(before)-len(d.B)]...)
+			if kind == scan.KindDir {
+				// Directory mtimes depend on every earlier child write, even
+				// when the final metadata is folded into a single connection.
+				if err := p.drain(); err != nil {
+					return err
+				}
+				if err := s.handle(t, entry); err != nil {
+					return err
+				}
+				continue
+			}
 			if err := p.submit(path, t, entry); err != nil {
 				return err
 			}
@@ -150,7 +164,19 @@ func (p *applyPool) handle(s *server, t proto.Type, data []byte) error {
 		if err := p.drain(); err != nil {
 			return err
 		}
-		return s.handle(t, data)
+		if err := s.handle(t, data); err != nil {
+			return err
+		}
+		if t == proto.TNewSession {
+			// All workers are idle at this fence; future channel sends publish
+			// the new root/session before they execute another operation.
+			for _, worker := range p.servers {
+				worker.cleanup()
+				worker.root, worker.session = s.root, s.session
+			}
+			clear(p.ranges)
+		}
+		return nil
 	}
 	if d.Err != nil {
 		return d.Err

@@ -311,9 +311,3 @@ func (s *scheduler) waitIdle() error {
 		s.cond.Wait()
 	}
 }
-
-func (s *scheduler) hasWork() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return !s.emptyLocked() || s.pending > 0
-}

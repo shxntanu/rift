@@ -12,7 +12,9 @@ channel carries the fresh 256-bit random session secret and ephemeral listening
 port. Neither secrets nor proofs are printed in diagnostics. Direct connections
 must use that same absolute root and session ID and cannot open another listener.
 The listener lasts for the SSH control session and closes all accepted sockets
-when that session ends.
+when that session ends. Direct streams reject `TNewSession` and are not retained
+between agent runs; each sync receives a fresh SSH bootstrap. Ordinary SSH
+streams retain the existing session reuse and watched scans.
 
 The service runs as the SSH user, with the same filesystem permissions as the
 SSH transport. Root binding prevents a direct handshake from choosing a new root;

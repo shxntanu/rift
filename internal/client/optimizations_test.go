@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/shxntanu/rift/internal/proto"
 	"github.com/shxntanu/rift/internal/scan"
+	"github.com/shxntanu/rift/internal/transport"
 )
 
 func TestConnectionCount(t *testing.T) {
@@ -100,5 +102,49 @@ func TestReadAheadCancellation(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("readers did not stop")
+	}
+}
+
+func TestRunnerWithDirectAndParallelApply(t *testing.T) {
+	for _, direct := range []bool{false, true} {
+		t.Run(fmt.Sprintf("direct=%v", direct), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			defer cancel()
+			r := NewRunner(ctx)
+			defer r.Close()
+			src, dst := t.TempDir(), t.TempDir()
+			opt := Options{Src: src, Dst: transport.Endpoint{Path: dst}, Conns: 4, Compress: 1, Delete: true, DeltaMin: 1 << 62, Transport: transport.Options{Direct: direct}, Log: io.Discard}
+			for round := range 3 {
+				// Reuse warmed connections while changing session IDs, including
+				// range writes whose temp files are shared between connections.
+				data := bytes.Repeat([]byte{byte(round + 1)}, 12<<20)
+				if err := os.WriteFile(filepath.Join(src, "large"), data, 0600); err != nil {
+					t.Fatal(err)
+				}
+				for i := range 300 {
+					if err := os.WriteFile(filepath.Join(src, fmt.Sprintf("small%d", i)), data[:100+round], 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				sum, err := r.Run(ctx, opt)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if sum.ErrorCount != 0 {
+					t.Fatal(sum.Errors)
+				}
+				assertSameTree(t, src, dst)
+				if direct && len(r.idle) != 0 {
+					t.Fatal("direct streams retained across bootstrap sessions")
+				}
+			}
+			sum, err := r.Run(ctx, opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sum.Transferred != 0 || sum.ErrorCount != 0 {
+				t.Fatalf("no-op: %+v", sum)
+			}
+		})
 	}
 }

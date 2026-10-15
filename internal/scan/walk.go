@@ -16,6 +16,7 @@ import (
 type Options struct {
 	Filter  *Filter
 	Workers int // 0 means a CPU-derived default
+	watch   func(string)
 }
 
 // Result is the outcome of a walk.
@@ -76,7 +77,7 @@ func Walk(ctx context.Context, root string, opt Options) (*Result, error) {
 	if workers <= 0 {
 		workers = min(max(runtime.NumCPU()*2, 4), 64)
 	}
-	w := &walker{root: root, filter: opt.Filter, stack: []dirItem{{dir: ""}}}
+	w := &walker{root: root, filter: opt.Filter, watch: opt.watch, stack: []dirItem{{dir: ""}}}
 	w.cond = sync.NewCond(&w.mu)
 	if opt.Filter.HasMerges() {
 		w.ctxs = map[string]*MergeCtx{}
@@ -110,6 +111,7 @@ func Walk(ctx context.Context, root string, opt Options) (*Result, error) {
 }
 
 type walker struct {
+	watch      func(string)
 	root       string
 	filter     *Filter
 	mergeNames []string
@@ -163,6 +165,9 @@ func (w *walker) readDir(it dirItem, out []Entry, subdirs []dirItem, linkBuf []b
 	abs := w.root
 	if dir != "" {
 		abs = w.root + "/" + dir
+	}
+	if w.watch != nil {
+		w.watch(dir)
 	}
 	fd, err := unix.Open(abs, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {

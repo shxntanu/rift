@@ -4,9 +4,15 @@
 
 <h1 align="center">rift</h1>
 
+<p align="center">
+  <a href="https://github.com/shxntanu/rift/stargazers"><img src="https://img.shields.io/github/stars/shxntanu/rift" alt="GitHub stars"></a>
+  <a href="https://github.com/shxntanu/rift/blob/main/LICENSE"><img src="https://img.shields.io/github/license/shxntanu/rift" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/Go-1.27%2B-00ADD8?logo=go&logoColor=white" alt="Go 1.27+">
+</p>
+
 rift is a blazing fast file transfer tool that moves the data over several SSH connections at
 once, splits big files across them with work stealing, and uses content-defined chunking
-for deltas. On a source tree it is several times faster than rsync, and a sync
+for deltas. On a source tree it is **6x** times faster than rsync, and a sync
 where nothing changed finishes in a fraction of a second.
 
 ```sh
@@ -35,18 +41,12 @@ I would just stop it and think of resuming this activity it some other day.
 
 ## Benchmarks
 
-The Go source tree (12,000 files, 156 MB), pushed to a local sshd on an Apple
-Silicon MacBook. Every run is warm: the page cache is hot, and rift reuses its
+Every run is warm: the page cache is hot, and rift reuses its
 persistent SSH connections.
 
-| Scenario                         | rsync |  rift |       |
-| -------------------------------- | ----: | ----: | ----: |
-| Fresh copy                       | 5.23s | 1.87s |  2.8x |
-| Nothing changed                  | 2.01s | 0.17s | 11.8x |
-| 2,000 files touched (mtime only) | 3.16s | 0.44s |  7.2x |
-| 50 files edited                  | 2.00s | 0.19s | 10.5x |
-| A subtree deleted                | 1.97s | 0.26s |  7.6x |
-| Small edit inside a 381 MB file  | 1.74s |  0.6s |  2.9x |
+| Scenario   |   rsync |    rift |      |
+| ---------- | ------: | ------: | ---: |
+| Fresh copy | 626.41s | 108.00s | 5.8x |
 
 The rsync here is the one that ships with macOS (openrsync). A localhost
 benchmark also hides network latency, which is exactly where rift's design
@@ -59,7 +59,27 @@ repository.
 A sync is a short conversation between the rift client and a `rift serve`
 process started over SSH on the remote end. Both are the same binary.
 
-**Scanning.** The local tree is walked by a pool of goroutines sharing a
+**Warm syncs and watch mode.** rift starts a private local agent at
+`~/.rift/agent.sock` automatically. It retains handshaken server processes,
+compression streams and watched scans, and exits after 15 idle minutes.
+`--no-persist` runs directly without the agent. Simultaneous requests queue,
+so overlapping roots cannot race; switching destinations resets the warm pool.
+Rebuilt binaries start a matching agent while older requests finish.
+
+```sh
+rift watch --delete ./ me@server:/code/project
+```
+
+Watch mode syncs once, then syncs after saves (checked every 100 ms). Linux
+uses inotify; macOS uses FSEvents with an event-delivery fence. Warm scans
+re-stat only changed directories and discover new subtrees. Overflow, watch
+limits, replaced roots, uncertain event delivery and per-directory merge
+filters fall back to full walks; `--gitignore` still asks git for membership.
+Other platforms use periodic full scans. A warm no-op takes one scan round
+trip; a small edit that changes size usually takes two. Hash comparisons,
+deltas and type conflicts can require additional round trips.
+
+**Scanning.** The initial local tree is walked by a pool of goroutines sharing a
 stack of directories. Each directory is read through its own file descriptor
 and its entries are stat'ed with `fstatat`, so paths are never resolved from
 the root again. This walk runs while SSH is still connecting, so the file
@@ -86,7 +106,8 @@ separate TCP connection with its own `ssh` process, so encryption spreads
 across cores and every connection gets its own congestion window. Extra
 connections are opened only when the plan calls for them; a one-file change
 uses one. Each connection keeps its own ControlMaster socket alive for 15
-minutes, so the next sync skips the SSH handshake. rift also asks SSH for
+minutes as a fallback when a server must be restarted. The agent retains the
+server streams themselves between runs. rift also asks SSH for
 AES-GCM, which is hardware-accelerated on any recent CPU.
 
 **Scheduling.** A pool of 24 readers opens and reads small files ahead of the
@@ -108,7 +129,7 @@ together, not by whichever one happened to pick it up.
 lane, preserving same-path order while unrelated files can be written in
 parallel; hash collisions simply serialize. Copied payloads are bounded to
 64 MiB and 256 operations per connection. Directory creation, deletions, reads,
-and sync barriers drain the pool. Delta sequences remain sequential. Metadata
+sync barriers, and directory metadata drain the pool. Delta sequences remain sequential. Metadata
 batches are split into individual path operations.
 
 **Deltas.** For a changed file of at least 128 KiB, the server computes a
@@ -189,7 +210,7 @@ rift's own options:
     --gitignore         send exactly what git would (see below)
     --delta-min=SIZE    smallest file to delta-transfer (default 128K)
     --no-fast-cipher    don't ask SSH for AES-GCM
-    --no-persist        don't keep SSH connections open between runs
+    --no-persist        disable the agent and warm server sessions
 ```
 
 ### Direct TCP (experimental)
@@ -204,6 +225,8 @@ travels over mutually authenticated AES-256-GCM TCP streams, bypassing the SSH
 channel window and SSH data encryption processes. The original SSH session
 stays open to own the listener; disconnecting it closes the listener and streams.
 Local destinations also support this mode for testing.
+With the persistent agent, watched local scans remain cached, but direct
+connections and their SSH bootstrap are recreated for each sync.
 
 If the listener cannot start or the initial TCP probe fails, rift uses the
 existing SSH connection. Failed extra TCP connections try SSH instead. This

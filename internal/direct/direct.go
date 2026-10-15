@@ -197,6 +197,7 @@ func Client(c net.Conn, offer Offer, slot int) (*Conn, error) {
 // concurrently. Empty authenticated records mark EOF; bare TCP EOF is an error.
 type Conn struct {
 	net.Conn
+	writeMu             sync.Mutex
 	r, w                cipher.AEAD
 	rseq, wseq          uint64
 	rbuf, pending, wbuf []byte
@@ -296,6 +297,8 @@ func (c *Conn) readRecord() error {
 }
 
 func (c *Conn) Write(src []byte) (int, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	if c.werr != nil {
 		return 0, c.werr
 	}
@@ -329,6 +332,8 @@ func (c *Conn) writeRecord(src []byte) error {
 
 // CloseWrite sends an authenticated EOF before half-closing TCP.
 func (c *Conn) CloseWrite() error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	if c.werr != nil {
 		return c.werr
 	}

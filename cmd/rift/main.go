@@ -8,15 +8,19 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime/debug"
 	"runtime/pprof"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/shxntanu/rift/internal/client"
 	"github.com/shxntanu/rift/internal/proto"
+	"github.com/shxntanu/rift/internal/scan"
 	"github.com/shxntanu/rift/internal/server"
 	"github.com/shxntanu/rift/internal/transport"
 	"github.com/zeebo/xxh3"
@@ -33,6 +37,7 @@ const usage = `rift - fast parallel directory sync over SSH, rsync compatible
 Usage:
   rift [OPTIONS] SRC [USER@]HOST:DEST
   rift [OPTIONS] SRC DEST
+  rift watch [OPTIONS] SRC [USER@]HOST:DEST
 
 Like rsync, "SRC/" copies the contents of SRC into DEST while "SRC" copies
 the directory itself to DEST/SRC. The remote side installs itself into
@@ -73,8 +78,8 @@ rift options:
                            deletes ignored files or .git on the receiver
       --delta-min=SIZE     delta-transfer changed files at least SIZE (128K)
       --no-fast-cipher     don't prefer AES-GCM for ssh
-      --no-persist         don't keep ssh connections open for 15 minutes
-                           (persisting makes the next sync skip handshakes)
+      --no-persist         disable the persistent agent and warm servers
+                           (agent exits after 15 idle minutes)
 `
 
 func main() {
@@ -95,6 +100,15 @@ func main() {
 		if err := server.Serve(stdio{}); err != nil {
 			fmt.Fprintln(os.Stderr, "rift serve:", err)
 			pprof.StopCPUProfile()
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "__agent" {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if err := serveAgent(ctx); err != nil {
+			fmt.Fprintln(os.Stderr, "rift agent:", err)
 			os.Exit(1)
 		}
 		return
@@ -131,6 +145,10 @@ func (stdio) Write(p []byte) (int, error) { return os.Stdout.Write(p) }
 func (stdio) Close() error                { return os.Stdout.Close() }
 
 func run(args []string) int {
+	watch := len(args) > 0 && args[0] == "watch"
+	if watch {
+		args = args[1:]
+	}
 	cfg, err := parseArgs(args)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "rift:", err)
@@ -177,6 +195,18 @@ func run(args []string) int {
 		dst.Path = "."
 	}
 
+	src, err = filepath.Abs(src)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "rift:", err)
+		return 1
+	}
+	if dst.Host == "" {
+		dst.Path, err = filepath.Abs(dst.Path)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "rift:", err)
+			return 1
+		}
+	}
 	sshFields := strings.Fields(cfg.ssh)
 	if len(sshFields) == 0 {
 		sshFields = []string{"ssh"}
@@ -218,24 +248,80 @@ func run(args []string) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	sum, err := client.Run(ctx, opt)
+	syncOnce := func() int {
+		var sum *client.Summary
+		var err error
+		if cfg.noPersist {
+			sum, err = client.Run(ctx, opt)
+		} else {
+			sum, err = runAgentClient(ctx, opt)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "rift:", err)
+			return 1
+		}
+		for _, e := range sum.Errors {
+			fmt.Fprintln(os.Stderr, "rift: error:", e)
+		}
+		if sum.ErrorCount > len(sum.Errors) {
+			fmt.Fprintf(os.Stderr, "rift: ... and %d more errors\n", sum.ErrorCount-len(sum.Errors))
+		}
+		if !cfg.quiet {
+			printSummary(sum, cfg.dryRun)
+		}
+		if sum.ErrorCount > 0 {
+			return 23
+		}
+		return 0
+	}
+	if !watch {
+		return syncOnce()
+	}
+	cache := scan.NewCache(src)
+	defer cache.Close()
+	filter, _ := scan.NewFilter(nil)
+	baseline, err := cache.Scan(ctx, filter)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "rift:", err)
+		fmt.Fprintln(os.Stderr, "rift watch:", err)
 		return 1
 	}
-	for _, e := range sum.Errors {
-		fmt.Fprintln(os.Stderr, "rift: error:", e)
+	snapshot := func(r *scan.Result) map[string]scan.Entry {
+		m := make(map[string]scan.Entry, len(r.Entries))
+		for _, e := range r.Entries {
+			m[e.Path] = e
+		}
+		return m
 	}
-	if sum.ErrorCount > len(sum.Errors) {
-		fmt.Fprintf(os.Stderr, "rift: ... and %d more errors\n", sum.ErrorCount-len(sum.Errors))
+	previous := snapshot(baseline)
+	code := syncOnce()
+	if code != 0 {
+		return code
 	}
-	if !cfg.quiet {
-		printSummary(sum, cfg.dryRun)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return 0
+		case <-ticker.C:
+			if !cache.Changed() {
+				continue
+			}
+			result, err := cache.Scan(ctx, filter)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "rift watch:", err)
+				return 1
+			}
+			next := snapshot(result)
+			if !cfg.checksum && maps.Equal(previous, next) {
+				continue
+			}
+			previous = next
+			if code := syncOnce(); code != 0 && ctx.Err() == nil {
+				fmt.Fprintln(os.Stderr, "rift watch: sync failed; waiting for the next change")
+			}
+		}
 	}
-	if sum.ErrorCount > 0 {
-		return 23
-	}
-	return 0
 }
 
 func printSummary(s *client.Summary, dryRun bool) {

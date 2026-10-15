@@ -123,6 +123,9 @@ func (c *Conn) CloseWrite() error {
 	return c.stdin.Close()
 }
 
+// CloseRead interrupts reads without waiting for the server process to exit.
+func (c *Conn) CloseRead() error { return c.stdout.Close() }
+
 // Close signals EOF to the server and waits briefly for it to exit.
 func (c *Conn) Close() error {
 	c.once.Do(func() {

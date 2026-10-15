@@ -23,6 +23,7 @@ import (
 	"github.com/shxntanu/rift/internal/direct"
 	"github.com/shxntanu/rift/internal/proto"
 	"github.com/shxntanu/rift/internal/scan"
+
 	"github.com/zeebo/xxh3"
 	"golang.org/x/sys/unix"
 )
@@ -38,6 +39,7 @@ type server struct {
 	ranges                  map[uint64]*rangeFile
 	delta                   *deltaState
 	buf                     []byte
+	cache                   *scan.Cache
 }
 
 type rangeFile struct {
@@ -85,6 +87,11 @@ func serve(rw io.ReadWriteCloser, root, session string) error {
 		}
 	}()
 	defer s.cleanup()
+	defer func() {
+		if s.cache != nil {
+			s.cache.Close()
+		}
+	}()
 	if err := s.handshake(); err != nil {
 		return err
 	}
@@ -140,32 +147,13 @@ func (s *server) handshake() error {
 	if ver != proto.Version {
 		return fail(fmt.Errorf("protocol mismatch: client v%d, server v%d", ver, proto.Version))
 	}
-	for _, r := range s.session {
-		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9') {
-			return fail(fmt.Errorf("bad session id"))
-		}
+	if s.boundRoot != "" && wantDirect {
+		return fail(errors.New("direct session cannot open a listener"))
 	}
-	if root == "~" || strings.HasPrefix(root, "~/") {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return fail(err)
-		}
-		root = filepath.Join(home, root[1:])
-	}
-	if root == "" {
-		root = "."
-	}
-	abs, err := filepath.Abs(root)
-	if err != nil {
+	if err := s.setSession(s.session, root); err != nil {
 		return fail(err)
 	}
-	if s.boundRoot != "" && (abs != s.boundRoot || s.session != s.boundSession || wantDirect) {
-		return fail(errors.New("direct session does not match SSH authorization"))
-	}
-	if err := os.MkdirAll(abs, 0o755); err != nil {
-		return fail(err)
-	}
-	s.root = abs
+	abs := s.root
 
 	s.enc.Reset()
 	s.enc.Uvarint(proto.Version)
@@ -174,7 +162,8 @@ func (s *server) handshake() error {
 	s.enc.Str(abs)
 	if wantDirect {
 		// Only the SSH-authorized root and session are valid on this listener.
-		listener, listenErr := direct.Listen(func(c *direct.Conn) { _ = serve(c, s.root, s.session) })
+		root, session := s.root, s.session
+		listener, listenErr := direct.Listen(func(c *direct.Conn) { _ = serve(c, root, session) })
 		if listenErr == nil {
 			s.listener = listener
 		} // A blocked listener falls back to SSH.
@@ -200,6 +189,18 @@ func (s *server) handshake() error {
 func (s *server) handle(t proto.Type, p []byte) error {
 	d := proto.Dec{B: p}
 	switch t {
+	case proto.TNewSession:
+		if s.boundRoot != "" || s.listener != nil {
+			return errors.New("direct transport requires a fresh SSH bootstrap for each session")
+		}
+		session, root := d.Str(), d.Str()
+		if d.Err != nil {
+			return d.Err
+		}
+		if err := s.setSession(session, root); err != nil {
+			return err
+		}
+		return nil
 	case proto.TScan:
 		return s.scan(&d)
 	case proto.THashReq:
@@ -296,7 +297,10 @@ func (s *server) scan(d *proto.Dec) error {
 	if err != nil {
 		return err
 	}
-	res, err := scan.Walk(context.Background(), s.root, scan.Options{Filter: filter})
+	if s.cache == nil {
+		s.cache = scan.NewCache(s.root)
+	}
+	res, err := s.cache.Scan(context.Background(), filter)
 	if err != nil {
 		return err
 	}
@@ -499,6 +503,13 @@ func (s *server) symlink(d *proto.Dec) error {
 	}
 	tmp := s.tmpPath(abs, id)
 	err = os.Symlink(target, tmp)
+	// workers can arrive before the primary's mkdir batch,
+	// so symlinks create missing parents just as file writes already do.
+	if errors.Is(err, os.ErrNotExist) {
+		if err = os.MkdirAll(filepath.Dir(tmp), 0o755); err == nil {
+			err = os.Symlink(target, tmp)
+		}
+	}
 	if err == nil {
 		_ = setMtime(tmp, mtime)
 		err = os.Rename(tmp, abs)
@@ -864,4 +875,43 @@ func (s *server) cleanup() {
 		}
 		delete(s.ranges, id)
 	}
+}
+
+func (s *server) setSession(session, root string) error {
+	if session == "" {
+		return errors.New("empty session id")
+	}
+	for _, r := range session {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9') {
+			return errors.New("bad session id")
+		}
+	}
+	if root == "~" || strings.HasPrefix(root, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		root = filepath.Join(home, root[1:])
+	}
+	if root == "" {
+		root = "."
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	if s.boundRoot != "" && (abs != s.boundRoot || session != s.boundSession) {
+		return errors.New("direct session does not match SSH authorization")
+	}
+	if err := os.MkdirAll(abs, 0o755); err != nil {
+		return err
+	}
+	s.cleanup()
+	if s.root != abs && s.cache != nil {
+		s.cache.Close()
+		s.cache = nil
+	}
+	s.root = abs
+	s.session = session
+	return nil
 }

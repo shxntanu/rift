@@ -24,12 +24,16 @@ import (
 // planner during setup, then the worker loop) writes to it; a dedicated
 // reader goroutine dispatches everything the server sends back.
 type rconn struct {
-	id  int
-	s   *session
-	pc  *proto.Conn
-	tc  *transport.Conn
-	enc proto.Enc
-	buf []byte
+	dispatchMu     sync.Mutex
+	id             int
+	root, platform string
+	rtt            time.Duration
+	needsSession   bool
+	s              *session
+	pc             *proto.Conn
+	tc             *transport.Conn
+	enc            proto.Enc
+	buf            []byte
 
 	scanCh chan scanMsg
 	hashCh chan hashResp
@@ -37,11 +41,95 @@ type rconn struct {
 	dead   chan struct{}
 	rerr   error
 
+	optional  atomic.Bool
 	closing   atomic.Bool
+	stopRead  atomic.Bool
+	stop      chan struct{}
+	readOnce  sync.Once
+	stopOnce  sync.Once
 	closeOnce sync.Once
+	closeErr  error
+
+	// an ack confirms its original send watermark, so an
+	// older barrier cannot hide frames sent while its reply was in flight.
+	ackMu sync.Mutex
+	sent  uint64
+	acked uint64
+	acks  map[frameAck]uint64
 
 	curFile *fileTask
 	curFH   *os.File
+}
+
+type frameAck struct {
+	t   proto.Type
+	seq uint64
+}
+
+// recordFrame runs before Send, since sending can flush buffered frames and
+// let the reader receive an acknowledgement before Send returns.
+func (rc *rconn) recordFrame(t proto.Type, p []byte) {
+	rc.ackMu.Lock()
+	defer rc.ackMu.Unlock()
+	rc.sent++
+	var ack frameAck
+	switch t {
+	case proto.TScan:
+		ack.t = proto.TScanDone
+	case proto.THashReq, proto.TSync:
+		d := proto.Dec{B: p}
+		ack.seq = d.Uvarint()
+		if t == proto.THashReq {
+			ack.t = proto.THashResp
+		} else {
+			ack.t = proto.TSyncAck
+		}
+	default:
+		return
+	}
+	if rc.acks == nil {
+		rc.acks = make(map[frameAck]uint64)
+	}
+	rc.acks[ack] = rc.sent
+}
+
+// recordScan accounts for the scan sent together with the hello, before the
+// rconn and its reader are created.
+func (rc *rconn) recordScan() { rc.recordFrame(proto.TScan, nil) }
+
+func (rc *rconn) send(t proto.Type, parts ...[]byte) error {
+	var p []byte
+	if len(parts) > 0 {
+		p = parts[0]
+	}
+	rc.recordFrame(t, p)
+	return rc.pc.Send(t, parts...)
+}
+
+func (rc *rconn) confirm(t proto.Type, seq uint64) {
+	rc.ackMu.Lock()
+	defer rc.ackMu.Unlock()
+	ack := frameAck{t, seq}
+	if n, ok := rc.acks[ack]; ok {
+		rc.acked = max(rc.acked, n)
+		delete(rc.acks, ack)
+	}
+}
+
+func (rc *rconn) unconfirmed() bool {
+	rc.ackMu.Lock()
+	defer rc.ackMu.Unlock()
+	return rc.sent != rc.acked
+}
+
+func (rc *rconn) startRead() {
+	rc.readOnce.Do(func() {
+		if rc.stopRead.Load() {
+			close(rc.dead)
+			return
+		}
+		go rc.readLoop()
+	})
 }
 
 type scanMsg struct {
@@ -63,15 +151,74 @@ type signature struct {
 	hashes []proto.Hash
 }
 
-func (s *session) connect(ctx context.Context, worker bool, id int) (*rconn, error) {
-	tc, err := s.dialer.Dial(ctx, worker, id)
+// connect pipelines the primary's scan behind its hello. scanSpecs waits for
+// the local scan after dialing, while worker connections pass nil.
+func (s *session) connect(ctx context.Context, worker bool, id int, scanSpecs func() ([]string, error)) (*rconn, error) {
+	if s.runner != nil && !s.opt.Transport.Direct {
+		if rc := s.runner.take(id, s); rc != nil {
+			if worker {
+				rc.needsSession = true
+				return rc, nil
+			}
+			var specs []string
+			var err error
+			if scanSpecs != nil {
+				specs, err = scanSpecs()
+				if err != nil {
+					rc.discard()
+					return nil, err
+				}
+			}
+			var enc proto.Enc
+			enc.Str(s.id)
+			enc.Str(s.opt.Dst.Path)
+			err = rc.send(proto.TNewSession, enc.B)
+			if err == nil && scanSpecs != nil {
+				enc.Reset()
+				enc.Uvarint(uint64(len(specs)))
+				for _, spec := range specs {
+					enc.Str(spec)
+				}
+				err = rc.send(proto.TScan, enc.B)
+			}
+			if err == nil {
+				err = rc.pc.Flush()
+			}
+			if err != nil {
+				rc.discard()
+				return nil, err
+			}
+			if id == 0 {
+				s.rtt = rc.rtt
+				s.remoteRoot = rc.root
+				s.remotePlatform = rc.platform
+			}
+			return rc, nil
+		}
+	}
+	dialCtx := ctx
+	if s.runner != nil && !s.opt.Transport.Direct {
+		dialCtx = s.runner.ctx
+	}
+	tc, err := s.dialer.Dial(dialCtx, worker, id)
 	if err != nil {
 		return nil, err
 	}
-	return s.hello(ctx, tc, id, id == 0 && s.opt.Transport.Direct)
+	var specs []string
+	if scanSpecs != nil {
+		specs, err = scanSpecs()
+		if err != nil {
+			_ = tc.Close()
+			return nil, err
+		}
+	}
+	return s.hello(ctx, tc, worker, id, id == 0 && s.opt.Transport.Direct, specs, scanSpecs != nil)
 }
 
-func (s *session) hello(ctx context.Context, tc *transport.Conn, id int, wantDirect bool) (*rconn, error) {
+func (s *session) hello(ctx context.Context, tc *transport.Conn, worker bool, id int, wantDirect bool, specs []string, scanRequested bool) (*rconn, error) {
+	stopDial := context.AfterFunc(ctx, func() { _ = tc.CloseRead(); _ = tc.CloseWrite() })
+	defer stopDial()
+	var err error
 	pc := proto.NewConn(tc)
 	var enc proto.Enc
 	enc.Uvarint(proto.Version)
@@ -84,17 +231,42 @@ func (s *session) hello(ctx context.Context, tc *transport.Conn, id int, wantDir
 		enc.U8(0)
 	}
 	started := time.Now()
-	var err error
-	if err = pc.Send(proto.THello, enc.B); err == nil {
-		err = pc.Flush()
-	}
-	if err != nil {
+	// keep the raw hello buffered while switching the write
+	// half, then send the scan in the same flush without waiting for hello OK.
+	if err := pc.Send(proto.THello, enc.B); err != nil {
 		_ = tc.Close()
 		return nil, fmt.Errorf("handshake: %w", err)
 	}
+	if s.opt.Compress > 0 {
+		if err := pc.EnableWriteCompression(s.opt.Compress); err != nil {
+			_ = pc.Close()
+			return nil, err
+		}
+	}
+	if scanRequested && !wantDirect {
+		enc.Reset()
+		enc.Uvarint(uint64(len(specs)))
+		for _, spec := range specs {
+			enc.Str(spec)
+		}
+		if len(enc.B) > proto.MaxFrame {
+			_ = pc.Close()
+			return nil, fmt.Errorf("scan frame too large: %d", len(enc.B))
+		}
+		err = pc.Send(proto.TScan, enc.B)
+	}
+	if err == nil {
+		err = pc.Flush()
+	}
+	writeErr := err
+	// A rejecting server can close its input before the pipelined scan has
+	// finished writing. Read its uncompressed TError even after a write fails.
 	t, p, err := pc.Recv()
 	if err != nil {
-		_ = tc.Close()
+		if writeErr != nil {
+			err = writeErr
+		}
+		_ = pc.Close()
 		return nil, fmt.Errorf("handshake: %w", err)
 	}
 	rtt := time.Since(started)
@@ -104,15 +276,23 @@ func (s *session) hello(ctx context.Context, tc *transport.Conn, id int, wantDir
 	case proto.TError:
 		d.Uvarint()
 		d.U8()
-		_ = tc.Close()
-		return nil, fmt.Errorf("server: %s", d.Str())
+		msg := d.Str()
+		_ = pc.Close()
+		if d.Err != nil {
+			return nil, fmt.Errorf("handshake: %w", d.Err)
+		}
+		return nil, fmt.Errorf("server: %s", msg)
 	default:
-		_ = tc.Close()
+		_ = pc.Close()
 		return nil, fmt.Errorf("handshake: unexpected message %d", t)
+	}
+	if writeErr != nil {
+		_ = tc.Close()
+		return nil, fmt.Errorf("handshake: %w", writeErr)
 	}
 	version := d.Uvarint()
 	if version != proto.Version {
-		_ = tc.Close()
+		_ = pc.Close()
 		return nil, fmt.Errorf("server protocol version %d", version)
 	}
 	goos, goarch, root := d.Str(), d.Str(), d.Str()
@@ -142,19 +322,38 @@ func (s *session) hello(ctx context.Context, tc *transport.Conn, id int, wantDir
 			s.debugf("direct TCP connected")
 			// Use the SSH-resolved absolute path for the bound direct session.
 			s.opt.Dst.Path = root
-			return s.hello(ctx, data, id, false)
+			return s.hello(ctx, data, worker, id, false, specs, scanRequested)
 		}
 		s.logf("direct TCP unavailable (%v); using SSH", directErr)
 		s.debugf("direct TCP unavailable (%v); using SSH", directErr)
 	}
 	if s.opt.Compress > 0 {
-		if err := pc.EnableCompression(s.opt.Compress); err != nil {
-			_ = tc.Close()
+		// the read half switches only after a raw hello OK;
+		// a rejected hello is always decoded as an uncompressed error above.
+		if err := pc.EnableReadCompression(); err != nil {
+			_ = pc.Close()
+			return nil, err
+		}
+	}
+	if wantDirect && scanRequested {
+		enc.Reset()
+		enc.Uvarint(uint64(len(specs)))
+		for _, spec := range specs {
+			enc.Str(spec)
+		}
+		if err := pc.Send(proto.TScan, enc.B); err != nil {
+			_ = pc.Close()
+			return nil, err
+		}
+		if err := pc.Flush(); err != nil {
+			_ = pc.Close()
 			return nil, err
 		}
 	}
 	rc := &rconn{
-		id:     id,
+		id:   id,
+		rtt:  rtt,
+		root: root, platform: goos + "/" + goarch,
 		s:      s,
 		pc:     pc,
 		tc:     tc,
@@ -163,28 +362,91 @@ func (s *session) hello(ctx context.Context, tc *transport.Conn, id int, wantDir
 		hashCh: make(chan hashResp, 4),
 		syncCh: make(chan uint64, 4),
 		dead:   make(chan struct{}),
+		stop:   make(chan struct{}),
 	}
-	go rc.readLoop()
+	rc.optional.Store(worker)
+	if scanRequested {
+		rc.recordScan()
+	}
+	// Speculative workers start their reader when adopted, so an unused
+	// connection cannot abort the session during cleanup.
+	if !worker {
+		rc.startRead()
+	}
 	return rc, nil
 }
 
-// close shuts the connection down in order: end our stream, let the server
-// finish and hang up, then release the reader. Workers must have stopped.
-func (rc *rconn) close() {
+// close ends our stream and waits for the server only when frames remain
+// unconfirmed. Workers must have stopped before it is called.
+func (rc *rconn) close() error {
 	rc.closeOnce.Do(func() {
-		rc.closing.Store(true)
-		if rc.curFH != nil {
-			rc.curFH.Close()
+		if rc.s.runner != nil && !rc.s.opt.Transport.Direct && rc.s.ctx.Err() == nil && rc.s.sched.failed() == nil {
+			rc.startRead()
+			if rc.curFH != nil {
+				_ = rc.curFH.Close()
+				rc.curFH = nil
+				rc.curFile = nil
+			}
+			if rc.unconfirmed() {
+				seq := rc.s.seq.Add(1)
+				rc.closeErr = rc.sync(seq)
+				if rc.closeErr == nil {
+					rc.closeErr = rc.waitSync(seq, rc.s.sched.abortCh)
+				}
+			}
+			select {
+			case <-rc.dead:
+				if rc.closeErr == nil {
+					rc.closeErr = rc.rerr
+				}
+			default:
+			}
+			if rc.closeErr == nil {
+				rc.s.runner.put(rc)
+				return
+			}
 		}
-		_ = rc.pc.CloseWrite()
+		pending := rc.unconfirmed()
+		rc.closing.Store(true)
+		if !pending {
+			rc.stopRead.Store(true)
+		}
+		rc.stopOnce.Do(func() { close(rc.stop) })
+		rc.startRead()
+		if rc.curFH != nil {
+			_ = rc.curFH.Close()
+		}
+		werr := rc.pc.CloseWrite()
+		if !pending {
+			// all server errors precede the last ack. Stop
+			// reading and reap in the background to skip the server-exit RTT.
+			_ = rc.tc.CloseRead()
+			<-rc.dead
+			rc.closeErr = rc.rerr
+			go func() { _ = rc.pc.Close() }()
+			return
+		}
+		// EOF replaces the final barrier for pending deletes
+		// and directory metadata. Drain errors before accepting server exit.
+		if werr != nil {
+			rc.closeErr = fmt.Errorf("connection %d: close write: %w", rc.id, werr)
+		}
+		timer := time.NewTimer(5 * time.Second)
+		defer timer.Stop()
 		select {
 		case <-rc.dead:
-		case <-time.After(5 * time.Second):
-			_ = rc.tc.Close() // unblock Recv before releasing its decoder
+		case <-timer.C:
+			rc.closeErr = errors.Join(rc.closeErr, fmt.Errorf("connection %d: timed out waiting for server exit", rc.id))
+			rc.stopRead.Store(true)
+			_ = rc.tc.CloseRead()
 			<-rc.dead
 		}
-		_ = rc.pc.Close()
+		rc.closeErr = errors.Join(rc.closeErr, rc.rerr)
+		if err := rc.pc.Close(); err != nil {
+			rc.closeErr = errors.Join(rc.closeErr, fmt.Errorf("connection %d: server exit: %w", rc.id, err))
+		}
 	})
+	return rc.closeErr
 }
 
 func (rc *rconn) readLoop() {
@@ -192,20 +454,32 @@ func (rc *rconn) readLoop() {
 	for {
 		t, p, err := rc.pc.Recv()
 		if err != nil {
-			if !rc.closing.Load() {
-				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			rc.dispatchMu.Lock()
+			defer rc.dispatchMu.Unlock()
+			// Final-batch teardown expects clean EOF, but must retain a
+			// truncated frame or any other receive error.
+			cleanEOF := rc.closing.Load() && errors.Is(err, io.EOF)
+			if !rc.stopRead.Load() && !cleanEOF {
+				if errors.Is(err, io.EOF) {
 					err = errors.New("server closed the connection")
 				}
 				rc.rerr = fmt.Errorf("connection %d: %w", rc.id, err)
-				rc.s.sched.abort(rc.rerr)
+				if !rc.optional.Load() {
+					rc.s.sched.abort(rc.rerr)
+				}
 			}
 			return
 		}
+		rc.dispatchMu.Lock()
 		if err := rc.dispatch(t, p); err != nil {
 			rc.rerr = fmt.Errorf("connection %d: %w", rc.id, err)
-			rc.s.sched.abort(rc.rerr)
+			if !rc.optional.Load() {
+				rc.s.sched.abort(rc.rerr)
+			}
+			rc.dispatchMu.Unlock()
 			return
 		}
+		rc.dispatchMu.Unlock()
 	}
 }
 
@@ -222,7 +496,10 @@ func (rc *rconn) dispatch(t proto.Type, p []byte) error {
 		if d.Err != nil {
 			return d.Err
 		}
-		rc.scanCh <- scanMsg{entries: entries}
+		select {
+		case rc.scanCh <- scanMsg{entries: entries}:
+		case <-rc.stop:
+		}
 	case proto.TScanDone:
 		d.Uvarint()
 		n := int(d.Uvarint())
@@ -230,7 +507,14 @@ func (rc *rconn) dispatch(t proto.Type, p []byte) error {
 		for range n {
 			warns = append(warns, d.Str())
 		}
-		rc.scanCh <- scanMsg{done: true, warnings: warns}
+		if d.Err != nil {
+			return d.Err
+		}
+		rc.confirm(proto.TScanDone, 0)
+		select {
+		case rc.scanCh <- scanMsg{done: true, warnings: warns}:
+		case <-rc.stop:
+		}
 	case proto.THashResp:
 		r := hashResp{req: d.Uvarint()}
 		n := int(d.Uvarint())
@@ -245,7 +529,11 @@ func (rc *rconn) dispatch(t proto.Type, p []byte) error {
 		if d.Err != nil {
 			return d.Err
 		}
-		rc.hashCh <- r
+		rc.confirm(proto.THashResp, r.req)
+		select {
+		case rc.hashCh <- r:
+		case <-rc.stop:
+		}
 	case proto.TSig:
 		id := d.Uvarint()
 		f := s.file(id)
@@ -285,11 +573,22 @@ func (rc *rconn) dispatch(t proto.Type, p []byte) error {
 		}
 		s.rangeProgress(f, n)
 	case proto.TSyncAck:
-		rc.syncCh <- d.Uvarint()
+		seq := d.Uvarint()
+		if d.Err != nil {
+			return d.Err
+		}
+		rc.confirm(proto.TSyncAck, seq)
+		select {
+		case rc.syncCh <- seq:
+		case <-rc.stop:
+		}
 	case proto.TError:
 		id := d.Uvarint()
 		code := d.U8()
 		msg := d.Str()
+		if d.Err != nil {
+			return d.Err
+		}
 		if code == proto.CodeFatal {
 			return fmt.Errorf("server: %s", msg)
 		}
@@ -302,11 +601,27 @@ func (rc *rconn) dispatch(t proto.Type, p []byte) error {
 
 // work is the worker loop: pull jobs, execute them, repeat.
 func (rc *rconn) work() {
-	s := rc.s
-	if !s.sched.join() {
+	if !rc.s.sched.join() {
 		return
 	}
+	rc.workJoined()
+}
+
+// speculative workers join before starting their reader or
+// entering the active pool, so teardown can exclude late handshakes atomically.
+func (rc *rconn) workJoined() {
+	s := rc.s
 	defer s.sched.leave()
+	if rc.needsSession {
+		rc.enc.Reset()
+		rc.enc.Str(s.id)
+		rc.enc.Str(s.opt.Dst.Path)
+		if err := rc.send(proto.TNewSession, rc.enc.B); err != nil {
+			s.sched.abort(err)
+			return
+		}
+		rc.needsSession = false
+	}
 	var batch []job
 	for {
 		jobs, err := s.sched.next(rc.id, batch[:0], rc.pc.Flush)
@@ -340,7 +655,7 @@ func (rc *rconn) do(j *job) error {
 		rc.enc.Varint(f.e.Mtime)
 		rc.s.logf(">l %s -> %s", f.e.Path, f.e.Link)
 		rc.s.st.filesDone.Add(1)
-		return rc.pc.Send(proto.TSymlink, rc.enc.B)
+		return rc.send(proto.TSymlink, rc.enc.B)
 	case jobRange:
 		return rc.sendRange(j.rt)
 	case jobFinalize:
@@ -351,12 +666,12 @@ func (rc *rconn) do(j *job) error {
 		rc.enc.Uvarint(uint64(f.e.Mode))
 		rc.enc.Varint(f.e.Mtime)
 		rc.s.st.filesDone.Add(1)
-		return rc.pc.Send(proto.TFinalize, rc.enc.B)
+		return rc.send(proto.TFinalize, rc.enc.B)
 	case jobSigReq:
 		rc.enc.Reset()
 		rc.enc.Uvarint(j.f.id)
 		rc.enc.Str(j.f.e.Path)
-		if err := rc.pc.Send(proto.TSigReq, rc.enc.B); err != nil {
+		if err := rc.send(proto.TSigReq, rc.enc.B); err != nil {
 			return err
 		}
 		return rc.pc.Flush()
@@ -400,7 +715,7 @@ func (rc *rconn) put(j *job) error {
 	s.st.bytesDone.Add(f.e.Size)
 	s.st.literal.Add(int64(len(data)))
 	s.st.filesDone.Add(1)
-	return rc.pc.Send(proto.TPut, rc.enc.B, data)
+	return rc.send(proto.TPut, rc.enc.B, data)
 }
 
 func readSmall(path string, buf []byte) ([]byte, error) {
@@ -507,7 +822,7 @@ func (rc *rconn) sendRange(rt *rangeTask) error {
 		rc.enc.Str(f.e.Path)
 		rc.enc.Uvarint(uint64(f.e.Size))
 		rc.enc.Uvarint(uint64(ch.off))
-		if err := rc.pc.Send(proto.TRangeWrite, rc.enc.B, ch.buf); err != nil {
+		if err := rc.send(proto.TRangeWrite, rc.enc.B, ch.buf); err != nil {
 			return err
 		}
 		s.st.bytesDone.Add(int64(len(ch.buf)))
@@ -516,7 +831,7 @@ func (rc *rconn) sendRange(rt *rangeTask) error {
 	}
 	rc.enc.Reset()
 	rc.enc.Uvarint(f.id)
-	if err := rc.pc.Send(proto.TRangeClose, rc.enc.B); err != nil {
+	if err := rc.send(proto.TRangeClose, rc.enc.B); err != nil {
 		return err
 	}
 	return rc.pc.Flush()
@@ -588,7 +903,7 @@ func (rc *rconn) sendDelta(f *fileTask, sig *signature) error {
 	rc.enc.Uvarint(f.id)
 	rc.enc.Str(f.e.Path)
 	rc.enc.Uvarint(uint64(size))
-	if err := rc.pc.Send(proto.TDeltaBegin, rc.enc.B); err != nil {
+	if err := rc.send(proto.TDeltaBegin, rc.enc.B); err != nil {
 		return err
 	}
 	var literal, matched int64
@@ -597,7 +912,7 @@ func (rc *rconn) sendDelta(f *fileTask, sig *signature) error {
 			rc.enc.Reset()
 			rc.enc.Uvarint(uint64(op.off))
 			rc.enc.Uvarint(uint64(op.n))
-			if err := rc.pc.Send(proto.TDeltaCopy, rc.enc.B); err != nil {
+			if err := rc.send(proto.TDeltaCopy, rc.enc.B); err != nil {
 				return err
 			}
 			matched += op.n
@@ -608,7 +923,7 @@ func (rc *rconn) sendDelta(f *fileTask, sig *signature) error {
 			buf := rc.buf[:k]
 			r, _ := fh.ReadAt(buf, op.off+done)
 			clear(buf[r:]) // a changed file fails the server's hash check and is resent in full
-			if err := rc.pc.Send(proto.TDeltaData, buf); err != nil {
+			if err := rc.send(proto.TDeltaData, buf); err != nil {
 				return err
 			}
 			done += k
@@ -620,7 +935,7 @@ func (rc *rconn) sendDelta(f *fileTask, sig *signature) error {
 	rc.enc.Uvarint(uint64(f.e.Mode))
 	rc.enc.Varint(f.e.Mtime)
 	rc.enc.Hash(proto.Hash{Hi: sum.Hi, Lo: sum.Lo})
-	if err := rc.pc.Send(proto.TDeltaEnd, rc.enc.B); err != nil {
+	if err := rc.send(proto.TDeltaEnd, rc.enc.B); err != nil {
 		return err
 	}
 	s.logf(">d %s (%.0f%% reused)", f.e.Path, 100*float64(matched)/float64(max(size, 1)))
@@ -649,7 +964,7 @@ func (rc *rconn) sendMeta(ms []metaUpdate) error {
 			rc.enc.Uvarint(uint64(m.mode))
 			rc.enc.Varint(m.mtime)
 		}
-		if err := rc.pc.Send(proto.TMeta, rc.enc.B); err != nil {
+		if err := rc.send(proto.TMeta, rc.enc.B); err != nil {
 			return err
 		}
 		ms = ms[n:]
@@ -666,7 +981,7 @@ func (rc *rconn) sendDeletes(paths []string, flags uint8) error {
 		for _, p := range paths[:n] {
 			rc.enc.Str(p)
 		}
-		if err := rc.pc.Send(proto.TDelete, rc.enc.B); err != nil {
+		if err := rc.send(proto.TDelete, rc.enc.B); err != nil {
 			return err
 		}
 		paths = paths[n:]
@@ -683,7 +998,7 @@ func (rc *rconn) sendMkdirs(dirs []scan.Entry) error {
 			rc.enc.Str(e.Path)
 			rc.enc.Uvarint(uint64(e.Mode))
 		}
-		if err := rc.pc.Send(proto.TMkdirs, rc.enc.B); err != nil {
+		if err := rc.send(proto.TMkdirs, rc.enc.B); err != nil {
 			return err
 		}
 		dirs = dirs[n:]
@@ -695,7 +1010,7 @@ func (rc *rconn) sendMkdirs(dirs []scan.Entry) error {
 func (rc *rconn) sync(seq uint64) error {
 	rc.enc.Reset()
 	rc.enc.Uvarint(seq)
-	if err := rc.pc.Send(proto.TSync, rc.enc.B); err != nil {
+	if err := rc.send(proto.TSync, rc.enc.B); err != nil {
 		return err
 	}
 	return rc.pc.Flush()
