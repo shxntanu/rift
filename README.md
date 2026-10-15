@@ -12,7 +12,7 @@
 
 rift is a blazing fast file transfer tool that moves the data over several SSH connections at
 once, splits big files across them with work stealing, and uses content-defined chunking
-for deltas. On a source tree it is several times faster than rsync, and a sync
+for deltas. On a source tree it is **6x** times faster than rsync, and a sync
 where nothing changed finishes in a fraction of a second.
 
 ```sh
@@ -45,14 +45,14 @@ The Go source tree (12,000 files, 156 MB), pushed to a local sshd on an Apple
 Silicon MacBook. Every run is warm: the page cache is hot, and rift reuses its
 persistent SSH connections.
 
-| Scenario                         | rsync |  rift |       |
-| -------------------------------- | ----: | ----: | ----: |
-| Fresh copy                       | 5.23s | 1.87s |  2.8x |
-| Nothing changed                  | 2.01s | 0.17s | 11.8x |
-| 2,000 files touched (mtime only) | 3.16s | 0.44s |  7.2x |
-| 50 files edited                  | 2.00s | 0.19s | 10.5x |
-| A subtree deleted                | 1.97s | 0.26s |  7.6x |
-| Small edit inside a 381 MB file  | 1.74s |  0.6s |  2.9x |
+| Scenario                         |   rsync |    rift |       |
+| -------------------------------- | ------: | ------: | ----: |
+| Fresh copy                       | 626.41s | 108.00s |  5.8x |
+| Nothing changed                  |   2.01s |   0.17s | 11.8x |
+| 2,000 files touched (mtime only) |   3.16s |   0.44s |  7.2x |
+| 50 files edited                  |   2.00s |   0.19s | 10.5x |
+| A subtree deleted                |   1.97s |   0.26s |  7.6x |
+| Small edit inside a 381 MB file  |   1.74s |    0.6s |  2.9x |
 
 The rsync here is the one that ships with macOS (openrsync). A localhost
 benchmark also hides network latency, which is exactly where rift's design
