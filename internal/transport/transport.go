@@ -103,6 +103,9 @@ func (c *Conn) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// CloseWrite signals EOF to the server.
+func (c *Conn) CloseWrite() error { return c.stdin.Close() }
+
 // Close signals EOF to the server and waits briefly for it to exit.
 func (c *Conn) Close() error {
 	c.once.Do(func() {
