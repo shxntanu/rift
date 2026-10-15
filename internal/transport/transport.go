@@ -135,7 +135,10 @@ const remoteDir = "$HOME/.rift/bin"
 func (d *Dialer) remoteBin() string { return remoteDir + "/rift-" + d.opt.BuildID }
 
 func (d *Dialer) sshArgs(worker bool, idx int) []string {
-	args := []string{"-T", "-x", "-o", "Compression=no", "-o", "ServerAliveInterval=15"}
+	// Like scp, drop any forwardings from the user's config: several parallel
+	// connections must not fight over the same forwarded sockets.
+	args := []string{"-T", "-x", "-a", "-o", "ClearAllForwardings=yes", "-o", "PermitLocalCommand=no",
+		"-o", "Compression=no", "-o", "ServerAliveInterval=15"}
 	if d.opt.FastCipher {
 		args = append(args, "-o", "Ciphers=^aes128-gcm@openssh.com,aes256-gcm@openssh.com")
 	}
