@@ -256,7 +256,11 @@ func (s *session) connect(ctx context.Context, worker bool, id int, scanSpecs fu
 	if scanSpecs != nil {
 		rc.recordScan()
 	}
-	rc.startRead()
+	// Speculative workers start their reader when adopted, so an unused
+	// connection cannot abort the session during cleanup.
+	if !worker {
+		rc.startRead()
+	}
 	return rc, nil
 }
 
@@ -450,10 +454,16 @@ func (rc *rconn) dispatch(t proto.Type, p []byte) error {
 
 // work is the worker loop: pull jobs, execute them, repeat.
 func (rc *rconn) work() {
-	s := rc.s
-	if !s.sched.join() {
+	if !rc.s.sched.join() {
 		return
 	}
+	rc.workJoined()
+}
+
+// speculative workers join before starting their reader or
+// entering the active pool, so teardown can exclude late handshakes atomically.
+func (rc *rconn) workJoined() {
+	s := rc.s
 	defer s.sched.leave()
 	var batch []job
 	for {

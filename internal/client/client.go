@@ -98,9 +98,10 @@ type session struct {
 	remoteRoot     string
 	remotePlatform string
 
-	connMu sync.Mutex
-	conns  []*rconn
-	seq    atomic.Uint64
+	connMu  sync.Mutex
+	conns   []*rconn
+	seq     atomic.Uint64
+	workers []*workerDial // speculative and selected worker handshakes.
 
 	errMu    sync.Mutex
 	errs     []string
@@ -308,6 +309,7 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 	// building the summary. Keep it deferred as well for early-return cleanup.
 	shutdown := func() error {
 		shutdownOnce.Do(func() {
+			s.stopWarmWorkers()
 			if s.sched.failed() != nil || ctx.Err() != nil {
 				// Kill the processes so workers blocked on a dead pipe return.
 				cancel()
@@ -330,6 +332,9 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 			cancel()
 			spawnWG.Wait()
 			shutdownErr = errors.Join(closeErrs...)
+			if shutdownErr == nil {
+				shutdownErr = s.sched.failed()
+			}
 			s.debugf("done")
 		})
 		return shutdownErr
@@ -337,6 +342,9 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 	defer func() { _ = shutdown() }() // Successful runs collect teardown errors below.
 
 	s.debugf("local scan: %d entries", len(ls.res.Entries))
+	// overlap worker handshakes with the remote scan; planning
+	// will retain only the connections justified by the actual transfer.
+	s.warmWorkers(ctx, &spawnWG, ls.res.Entries)
 
 	remote, remoteWarn, err := collectScan(ctrl, s.sched.abortCh)
 	if err != nil {
@@ -467,9 +475,51 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 	return sum, nil
 }
 
-// spawnWorkers opens extra connections sized to the planned work. They join
-// the pool whenever they are ready; work stealing rebalances around them, so
-// nothing waits for slow handshakes. Small syncs use the primary only.
+// keep speculative connections out of the active pool until
+// planning confirms it is useful. Only the Run goroutine chooses workers.
+type workerDial struct {
+	use     chan struct{}
+	cancel  context.CancelFunc
+	adopted bool
+}
+
+// use the existing 4 MiB/256-file sizing for both warming
+// and the actual plan; only planned deltas get the extra worker allowance.
+func (s *session) workerCount(bytes int64, files, deltas int) int {
+	return min(1+int(bytes/(4<<20))+files/256+deltas/4, s.opt.Conns)
+}
+
+// overlap worker handshakes with the remote scan. Local file
+// sizes estimate useful parallelism; planning discards unnecessary attempts.
+func (s *session) warmWorkers(ctx context.Context, wg *sync.WaitGroup, entries []scan.Entry) {
+	if s.opt.DryRun {
+		return
+	}
+	var bytes int64
+	var files int
+	for _, e := range entries {
+		if e.Kind == scan.KindFile {
+			bytes += e.Size
+			files++
+		}
+	}
+	for i := 1; i < s.workerCount(bytes, files, 0); i++ {
+		s.workers = append(s.workers, s.dialWorker(ctx, wg, i))
+	}
+}
+
+// cancel unused handshakes, including on an early return.
+// Adopted workers stay alive for graceful teardown after their final ack.
+func (s *session) stopWarmWorkers() {
+	for _, w := range s.workers {
+		if !w.adopted {
+			w.cancel()
+		}
+	}
+}
+
+// select warmed connections and fill any remaining slots.
+// Workers join as their handshakes finish, so transfers never wait on them.
 func (s *session) spawnWorkers(ctx context.Context, wg *sync.WaitGroup, p *plan) {
 	// Delta files mostly send copy instructions, so they count as files,
 	// not bytes.
@@ -478,25 +528,58 @@ func (s *session) spawnWorkers(ctx context.Context, wg *sync.WaitGroup, p *plan)
 		bytes += f.e.Size
 	}
 	files := len(p.transfers) + len(p.sigs)
-	want := 1 + int(bytes/(4<<20)) + files/256 + len(p.sigs)/4
-	want = min(want, s.opt.Conns)
+	want := s.workerCount(bytes, files, len(p.sigs))
 	for i := 1; i < want; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			rc, err := s.connect(ctx, true, i, nil)
-			if err != nil {
-				if ctx.Err() == nil && i == 1 {
-					s.logf("extra connections unavailable (%v); continuing with fewer", err)
-				}
-				return
-			}
-			defer rc.close()
-			s.addConn(rc)
-			s.debugf("connection %d ready", i)
-			rc.work()
-		}()
+		if i > len(s.workers) {
+			s.workers = append(s.workers, s.dialWorker(ctx, wg, i))
+		}
+		w := s.workers[i-1]
+		w.adopted = true
+		close(w.use)
 	}
+	s.stopWarmWorkers()
+}
+
+func (s *session) dialWorker(ctx context.Context, wg *sync.WaitGroup, id int) *workerDial {
+	ctx, cancel := context.WithCancel(ctx)
+	w := &workerDial{use: make(chan struct{}), cancel: cancel}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer cancel()
+		rc, err := s.connect(ctx, true, id, nil)
+		if rc != nil {
+			defer func() {
+				// Optimization 5: discarded attempts are optional; teardown
+				// collects the stored close error for every adopted connection.
+				_ = rc.close()
+			}()
+		}
+		select {
+		case <-w.use:
+		case <-ctx.Done():
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			if id == 1 {
+				s.logf("extra connections unavailable (%v); continuing with fewer", err)
+			}
+			return
+		}
+		// join before publishing this connection. Shutdown
+		// closes admission and waits for every joined worker before its snapshot.
+		if !s.sched.join() {
+			return
+		}
+		rc.startRead()
+		s.addConn(rc)
+		s.debugf("connection %d ready", id)
+		rc.workJoined()
+	}()
+	return w
 }
 
 func collectScan(rc *rconn, abort <-chan struct{}) ([]scan.Entry, []string, error) {
