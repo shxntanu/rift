@@ -373,15 +373,15 @@ func Run(ctx context.Context, opt Options) (*Summary, error) {
 	}
 	defer stopProgress()
 
-	// Conflicting paths and missing directories must exist before any
-	// worker writes files into them.
-	if len(p.conflicts) > 0 || len(p.mkdirs) > 0 {
-		if err := ctrl.sendDeletes(p.conflicts, proto.DeleteRecursive); err != nil {
-			return nil, err
-		}
-		if err := ctrl.sendMkdirs(p.mkdirs); err != nil {
-			return nil, err
-		}
+	if err := ctrl.sendDeletes(p.conflicts, proto.DeleteRecursive); err != nil {
+		return nil, err
+	}
+	if err := ctrl.sendMkdirs(p.mkdirs); err != nil {
+		return nil, err
+	}
+	// workers create missing parents themselves, so only type
+	// conflicts need a directory-creation barrier before workers start.
+	if len(p.conflicts) > 0 {
 		seq := s.seq.Add(1)
 		if err := ctrl.sync(seq); err != nil {
 			return nil, err
@@ -568,6 +568,7 @@ func (s *session) plan(ctx context.Context, ctrl *rconn, lres *scan.Result, remo
 		lmap[local[i].Path] = &local[i]
 	}
 	touched := map[string]bool{}
+	conflicts := map[string]bool{}
 	touch := func(rel string) {
 		touched[parentOf(rel)] = true
 	}
@@ -587,6 +588,7 @@ func (s *session) plan(ctx context.Context, ctrl *rconn, lres *scan.Result, remo
 		r := rmap[l.Path]
 		if r != nil && r.Kind != l.Kind && l.Path != "" {
 			p.conflicts = append(p.conflicts, l.Path)
+			conflicts[l.Path] = true
 			touch(l.Path)
 			r = nil
 		}
@@ -650,6 +652,11 @@ func (s *session) plan(ctx context.Context, ctrl *rconn, lres *scan.Result, remo
 			if _, ok := lmap[r.Path]; ok {
 				continue
 			}
+			// The conflict barrier already deleted these descendants. The
+			// final batch must not delete through their replacement file/link.
+			if hasAncestor(r.Path, conflicts) {
+				continue
+			}
 			if filter.Protected(r.Path, r.Kind == scan.KindDir, lres.CtxFor(r.Path)) {
 				continue
 			}
@@ -669,7 +676,7 @@ func (s *session) plan(ctx context.Context, ctrl *rconn, lres *scan.Result, remo
 			}
 			kept := extra[:0]
 			for _, e := range extra {
-				if !ignored[e] && !ignoredAncestor(e, ignored) {
+				if !ignored[e] && !hasAncestor(e, ignored) {
 					kept = append(kept, e)
 				}
 			}
@@ -700,9 +707,9 @@ func (s *session) plan(ctx context.Context, ctrl *rconn, lres *scan.Result, remo
 	return p, nil
 }
 
-func ignoredAncestor(p string, ignored map[string]bool) bool {
+func hasAncestor(p string, paths map[string]bool) bool {
 	for d := path.Dir(p); d != "." && d != "/"; d = path.Dir(d) {
-		if ignored[d] {
+		if paths[d] {
 			return true
 		}
 	}

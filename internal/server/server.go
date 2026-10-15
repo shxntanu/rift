@@ -461,6 +461,13 @@ func (s *server) symlink(d *proto.Dec) error {
 	}
 	tmp := s.tmpPath(abs, id)
 	err = os.Symlink(target, tmp)
+	// workers can arrive before the primary's mkdir batch,
+	// so symlinks create missing parents just as file writes already do.
+	if errors.Is(err, os.ErrNotExist) {
+		if err = os.MkdirAll(filepath.Dir(tmp), 0o755); err == nil {
+			err = os.Symlink(target, tmp)
+		}
+	}
 	if err == nil {
 		_ = setMtime(tmp, mtime)
 		err = os.Rename(tmp, abs)
