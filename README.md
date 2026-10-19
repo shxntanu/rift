@@ -67,7 +67,7 @@ repository.
 | Optimization                | What it does                                                                                                                                                 |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Automatic deployment        | Starts the same binary on the remote over SSH; installs a matching server when needed.                                                                       |
-| Persistent agent            | Opt in with `--persist` to reuse server processes, compression streams and watched scans; exits after 15 idle minutes.                                     |
+| Persistent agent            | Opt in with `--persist` to reuse server processes, compression streams and watched scans; exits after 15 idle minutes.                                       |
 | Safe session reuse          | Queues simultaneous syncs, resets connections when destinations change, and starts a matching agent after rebuilds.                                          |
 | Watch mode                  | `rift watch --delete ./ me@server:/code/project` syncs after saves, checking every 100 ms.                                                                   |
 | Incremental scans           | Uses inotify on Linux and FSEvents on macOS to re-scan changed directories; falls back to full walks when needed.                                            |
@@ -80,7 +80,7 @@ repository.
 | Adaptive connection count   | Uses planned work, hello RTT and the SSH window to size the pool: up to 8 on low-latency links, 32 otherwise.                                                |
 | SSH window detection        | Reads advertised windows when available; otherwise assumes 2 MiB, or skips fixed-window sizing for identified HPN builds.                                    |
 | Independent SSH connections | Gives each connection its own TCP window and encryption process; prefers hardware-accelerated AES-GCM.                                                       |
-| Warm SSH fallback           | With `--persist`, keeps separate ControlMaster sockets for 15 minutes so restarting a server can skip SSH handshakes.                                       |
+| Warm SSH fallback           | With `--persist`, keeps separate ControlMaster sockets for 15 minutes so restarting a server can skip SSH handshakes.                                        |
 | Small-file read-ahead       | 24 readers feed connection workers independently, bounded by 64 MiB and 1,024 files.                                                                         |
 | Batched small files         | Sends files up to 1 MiB with their metadata in one message; creates new files with final permissions.                                                        |
 | Parallel large files        | Schedules largest files first and writes 1 MiB chunks into shared temporary files across connections.                                                        |
@@ -135,33 +135,156 @@ files next to `rift`, because they are what gets uploaded to a remote. For
 any other platform, rift cross-compiles a server from the source tree when Go
 is available.
 
-### Publish a release
+## Use as a Go library
 
-Versions use Semantic Versioning with stable tags such as `v0.1.0`. Bump the
-patch for fixes, minor for features, and major for breaking changes. Protocol
-versions are tracked separately in `internal/proto/proto.go`.
+Import `github.com/shxntanu/rift` to sync directories directly from Go. Local
+transfers run entirely in-process; remote pushes use OpenSSH. The library
+requires Go 1.27.2 or newer and supports Linux and macOS.
 
-Releases are manual. After merging these changes to `main`, open the repository's
-**Actions → CI and releases → Run workflow**, select `main`, enter a new version
-(for example, `v0.1.0`), and run it. There is no scheduled release or automatic
-release on push. You do not need to create a tag yourself.
-
-GitHub Actions runs vet, race tests, and installer checks on Linux and macOS,
-then cross-compiles static binaries for all four platforms. It creates the
-version tag at the tested commit and publishes a
-GitHub Release with generated release notes, the versioned bundle,
-`checksums.txt`, and `install.sh`. The tag is embedded in `rift --version`;
-all binaries share the commit ID so clients deploy matching servers. No
-additional release secrets are needed beyond the workflow's `GITHUB_TOKEN`.
-The curl command becomes available after the first release is published.
-
-To build the same assets locally without publishing:
+The library and binary share release tags. After publishing `v0.3.0`, install
+the library with:
 
 ```sh
-make release VERSION=v0.1.0  # outputs to dist/
+go get github.com/shxntanu/rift@v0.3.0
 ```
 
-## Usage
+### Sync a local directory
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "time"
+
+    "github.com/shxntanu/rift"
+)
+
+func main() {
+    ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+    defer cancel()
+
+    summary, err := rift.Sync(ctx, "./src/", rift.Endpoint{Path: "./backup"}, rift.Options{})
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("Transferred %d files (%d bytes)\n", summary.Transferred, summary.Bytes)
+}
+```
+
+`src/` copies the directory's contents into `backup`; `src` copies the directory
+itself into `backup/src`. Sources must be local directories. The destination
+must not overlap the source.
+
+Zero-value options enable compression, deltas, and automatic connection sizing.
+Extra destination files are preserved unless you set `Delete: true`. Symlinks,
+permissions, and modification times are preserved; ownership, hard links, ACLs,
+and extended attributes are not synced.
+
+### Reuse sessions between syncs
+
+For repeated syncs, keep a `Runner` to reuse connections and watched scans:
+
+```go
+func syncDirectories(ctx context.Context, sources []string, dst rift.Endpoint) error {
+    runner := rift.NewRunner(ctx)
+    defer runner.Close()
+
+    for _, src := range sources {
+        if _, err := runner.Sync(ctx, src, dst, rift.Options{}); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+```
+
+Call `Sync` again on the same runner after source changes. Calls on one runner
+are serialized; separate runners do not coordinate writes to overlapping
+destinations. `Close` cancels active work and releases connections and watches.
+This runs inside your application and does not start the CLI's persistent agent.
+
+### Push over SSH
+
+Set `Endpoint.Host` and supply receiver binaries for the remote platforms you
+use. Extract them from the release bundle matching your library version, or
+build them from the same Rift revision. Map keys describe the **remote** OS and
+architecture, even when your application runs on another platform.
+
+```go
+func push(ctx context.Context) error {
+    _, err := rift.Sync(ctx, "./src/", rift.Endpoint{
+        Host: "me@server",
+        Path: "/code/project",
+    }, rift.Options{
+        SSH: rift.SSHOptions{
+            Args: []string{"-p", "2222"}, // Optional OpenSSH arguments.
+            ServerBinaries: map[string]string{
+                "linux/amd64": "./receivers/rift-linux-amd64",
+                "linux/arm64": "./receivers/rift-linux-arm64",
+            },
+        },
+    })
+    return err
+}
+```
+
+OpenSSH uses your normal SSH configuration and agent, including host aliases
+and jump hosts. Authentication is noninteractive, so credentials and host-key
+trust must already be configured. The remote needs `sh` and `gzip`; Rift
+uploads the supplied receiver into `~/.rift/bin` when needed. The library does
+not download or build receiver binaries and cannot talk to an rsync receiver.
+
+### Options, progress, and errors
+
+Set these fields on `rift.Options` as needed:
+
+- `Rules: []string{"- *.tmp", "P /build/***"}` filters transfers and protects
+  destination paths, using the same ordered rules as the CLI.
+- `DryRun: true` returns planned counts without changing the destination tree.
+  A remote dry run can still install its receiver into `~/.rift/bin`.
+- `Checksum: true` compares content even when size and mtime match.
+- `Conns: 8` caps connections; zero defaults to an automatically sized pool
+  with a maximum of 32.
+- `CompressionLevel: -1` disables compression; zero uses level 1, and levels
+  1–4 are supported. `WholeFile: true` disables delta transfers.
+- `GitIgnore: true` selects files through `git`, which requires a Git repository
+  and invokes the `git` executable even for local transfers.
+- `Log: os.Stderr` enables diagnostics; output is discarded by default.
+- `OnProgress: func(p rift.Progress) { /* update your display */ }` receives
+  structured snapshots without a terminal UI. Callbacks run serially within a
+  sync and must return promptly. Do not call `Sync` or `Close` on the same
+  runner synchronously from its callback.
+
+Use a context deadline or cancellation to stop a sync. Check cancellation with
+`errors.Is(err, context.Canceled)` or `errors.Is(err, context.DeadlineExceeded)`.
+Applied changes are not rolled back when a sync fails or is canceled.
+
+Individual operation failures return both a summary and a `*rift.PartialError`.
+Use `errors.As` to inspect the count and up to 50 diagnostic messages:
+
+```go
+func syncWithErrors(ctx context.Context, src string, dst rift.Endpoint) error {
+    summary, err := rift.Sync(ctx, src, dst, rift.Options{})
+    var partial *rift.PartialError
+    if errors.As(err, &partial) {
+        log.Printf("%d operations failed; %d files reported transferred",
+            partial.Count, summary.Transferred)
+        for _, message := range partial.Errors {
+            log.Print(message)
+        }
+    }
+    return err
+}
+```
+
+The helper examples use the `context`, `errors`, and `log` packages as applicable.
+See [rift.go](rift.go) for all options and API contracts, and
+[example_test.go](example_test.go) for a runnable local sync example.
+
+## CLI Usage
 
 ```
 rift [OPTIONS] SRC [USER@]HOST:DEST
@@ -331,6 +454,32 @@ rift is young, and it does one direction of rsync's job.
 - Linux and macOS, on both ends.
 - The wire protocol isn't stable. That only matters if you mix builds: each
   client installs a server keyed to its own build, so both ends always match.
+
+## Publish a release
+
+Versions use Semantic Versioning with stable tags such as `v0.1.0`. Bump the
+patch for fixes, minor for features, and major for breaking changes. Protocol
+versions are tracked separately in `internal/proto/proto.go`.
+
+Releases are manual. After merging these changes to `main`, open the repository's
+**Actions → CI and releases → Run workflow**, select `main`, enter a new version
+(for example, `v0.1.0`), and run it. There is no scheduled release or automatic
+release on push. You do not need to create a tag yourself.
+
+GitHub Actions runs vet, race tests, and installer checks on Linux and macOS,
+then cross-compiles static binaries for all four platforms. It creates the
+version tag at the tested commit and publishes a
+GitHub Release with generated release notes, the versioned bundle,
+`checksums.txt`, and `install.sh`. The tag is embedded in `rift --version`;
+all binaries share the commit ID so clients deploy matching servers. No
+additional release secrets are needed beyond the workflow's `GITHUB_TOKEN`.
+The curl command becomes available after the first release is published.
+
+To build the same assets locally without publishing:
+
+```sh
+make release VERSION=v0.1.0  # outputs to dist/
+```
 
 ## License
 

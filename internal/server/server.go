@@ -70,8 +70,6 @@ func ServeContext(ctx context.Context, rw io.ReadWriteCloser) error {
 	return serve(ctx, rw, "", "")
 }
 
-var setUmask sync.Once
-
 func serve(ctx context.Context, rw io.ReadWriteCloser, root, session string) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -80,9 +78,6 @@ func serve(ctx context.Context, rw io.ReadWriteCloser, root, session string) err
 	if _, err := io.WriteString(rw, proto.Magic); err != nil {
 		return err
 	}
-	// Files and directories are created with their final permissions, saving
-	// a chmod per file.
-	setUmask.Do(func() { unix.Umask(0) })
 	s := &server{
 		ctx:       ctx,
 		raw:       rw,
@@ -308,10 +303,16 @@ func (s *server) scan(d *proto.Dec) error {
 	if err != nil {
 		return err
 	}
-	if s.cache == nil {
-		s.cache = scan.NewCache(s.root)
+	res := &scan.Result{}
+	_, err = os.Stat(s.root)
+	if err == nil {
+		if s.cache == nil {
+			s.cache = scan.NewCache(s.root)
+		}
+		res, err = s.cache.Scan(s.ctx, filter)
+	} else if errors.Is(err, os.ErrNotExist) {
+		err = nil
 	}
-	res, err := s.cache.Scan(s.ctx, filter)
 	if err != nil {
 		return err
 	}
@@ -416,27 +417,39 @@ func (s *server) mkdirs(d *proto.Dec) error {
 		if err != nil {
 			return err
 		}
-		if err := os.Mkdir(abs, scan.FileMode(mode)|0o700); err != nil {
-			if fi, serr := os.Lstat(abs); serr == nil && fi.IsDir() {
-				continue
-			}
-			if errors.Is(err, os.ErrNotExist) {
-				err = os.MkdirAll(abs, scan.FileMode(mode)|0o700)
-			}
-			if err != nil {
-				if err := s.sendErr(0, proto.CodeGeneric, err); err != nil {
-					return err
-				}
+		if err := mkdirAll(abs, scan.FileMode(mode)|0o700); err != nil {
+			if err := s.sendErr(0, proto.CodeGeneric, err); err != nil {
+				return err
 			}
 		}
 	}
 	return nil
 }
 
+// mkdirAll leaves existing directories alone and makes new directories usable
+// while receiving. Final directory metadata restores source modes afterwards.
+// Never change the host application's process-wide umask.
+func mkdirAll(path string, mode os.FileMode) error {
+	err := os.Mkdir(path, mode)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := mkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return err
+		}
+		err = os.Mkdir(path, mode)
+	}
+	if err != nil {
+		if fi, statErr := os.Stat(path); statErr == nil && fi.IsDir() {
+			return nil
+		}
+		return err
+	}
+	return os.Chmod(path, mode)
+}
+
 func createFile(path string, flag int, perm os.FileMode) (*os.File, error) {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|flag, perm)
 	if err != nil && errors.Is(err, os.ErrNotExist) {
-		if merr := os.MkdirAll(filepath.Dir(path), 0o755); merr == nil {
+		if merr := mkdirAll(filepath.Dir(path), 0o755); merr == nil {
 			f, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|flag, perm)
 		}
 	}
@@ -472,12 +485,9 @@ func (s *server) put(d *proto.Dec) error {
 				return err
 			}
 		}
-		// Special bits are not reliably applied at create.
-		if mode&0o7000 != 0 {
-			if err := f.Chmod(scan.FileMode(mode)); err != nil {
-				f.Close()
-				return err
-			}
+		if err := f.Chmod(scan.FileMode(mode)); err != nil {
+			_ = f.Close() // Preserve the chmod error.
+			return err
 		}
 		if err := setFileTimes(f, target, mtime); err != nil {
 			f.Close()
@@ -517,7 +527,7 @@ func (s *server) symlink(d *proto.Dec) error {
 	// workers can arrive before the primary's mkdir batch,
 	// so symlinks create missing parents just as file writes already do.
 	if errors.Is(err, os.ErrNotExist) {
-		if err = os.MkdirAll(filepath.Dir(tmp), 0o755); err == nil {
+		if err = mkdirAll(filepath.Dir(tmp), 0o755); err == nil {
 			err = os.Symlink(target, tmp)
 		}
 	}
@@ -913,9 +923,6 @@ func (s *server) setSession(session, root string) error {
 	}
 	if s.boundRoot != "" && (abs != s.boundRoot || session != s.boundSession) {
 		return errors.New("direct session does not match SSH authorization")
-	}
-	if err := os.MkdirAll(abs, 0o755); err != nil {
-		return err
 	}
 	s.cleanup()
 	if s.root != abs && s.cache != nil {

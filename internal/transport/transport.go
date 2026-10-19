@@ -1,5 +1,5 @@
-// Package transport spawns rift server processes, locally or over SSH, and
-// deploys the rift binary to remote hosts on first use.
+// Package transport connects to in-process or SSH-hosted rift receivers and
+// deploys receiver binaries to remote hosts on first use.
 package transport
 
 import (
@@ -50,11 +50,14 @@ func (e Endpoint) String() string {
 
 // Options configure how server processes are started.
 type Options struct {
-	Direct     bool     // opt-in SSH-bootstrapped encrypted TCP
-	SSH        string   // ssh binary
-	SSHArgs    []string // extra args inserted before the host
-	FastCipher bool     // prefer AES-GCM, which is hardware accelerated on most CPUs
-	BuildID    string   // identifies the exact rift build; names the remote binary
+	Direct         bool              // opt-in SSH-bootstrapped encrypted TCP
+	SSH            string            // ssh binary
+	SSHArgs        []string          // extra args inserted before the host
+	FastCipher     bool              // prefer AES-GCM, which is hardware accelerated on most CPUs
+	BuildID        string            // identifies the exact rift build; names the remote binary
+	ServerBinaries map[string]string // optional explicit goos/goarch -> receiver binary
+	NonInteractive bool              // prohibit SSH prompts, including on the primary connection
+	Log            io.Writer         `json:"-"`
 	// Persist keeps every connection's ssh session alive in the background
 	// (ControlMaster/ControlPersist) so the next sync skips TCP and key
 	// exchange handshakes entirely.
@@ -66,6 +69,7 @@ type Options struct {
 type Dialer struct {
 	ep  Endpoint
 	opt Options
+	log *diagnosticWriter
 
 	localSSH, remoteSSH string
 	sshWindow           int64
@@ -85,7 +89,32 @@ func NewDialer(ep Endpoint, opt Options) *Dialer {
 	if opt.SSH == "" {
 		opt.SSH = "ssh"
 	}
-	return &Dialer{ep: ep, opt: opt}
+	if opt.Log == nil {
+		opt.Log = os.Stderr
+	}
+	return &Dialer{ep: ep, opt: opt, log: &diagnosticWriter{out: opt.Log}}
+}
+
+// Log serializes receiver diagnostics with client logs, including writes from
+// exec's stderr-copy goroutines. Retained processes hold this stable writer.
+func (d *Dialer) Log() io.Writer { return d.log }
+
+// SetLog changes the current request's diagnostic sink on a retained dialer.
+func (d *Dialer) SetLog(out io.Writer) {
+	d.log.mu.Lock()
+	d.log.out = out
+	d.log.mu.Unlock()
+}
+
+type diagnosticWriter struct {
+	mu  sync.Mutex
+	out io.Writer
+}
+
+func (w *diagnosticWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.out.Write(p)
 }
 
 // Conn carries the protocol over a server process or an encrypted TCP stream.
@@ -93,6 +122,7 @@ type Conn struct {
 	stop   func() bool
 	cancel context.CancelFunc
 	cmd    *exec.Cmd
+	wait   func() error // joins an in-process receiver
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
 	stderr *stderrBuffer
@@ -103,7 +133,7 @@ type Conn struct {
 
 func (c *Conn) Read(p []byte) (int, error) {
 	n, err := c.stdout.Read(p)
-	if c.cmd != nil {
+	if c.cmd != nil || c.wait != nil {
 		c.d.WireIn.Add(int64(n))
 	}
 	return n, err
@@ -111,7 +141,7 @@ func (c *Conn) Read(p []byte) (int, error) {
 
 func (c *Conn) Write(p []byte) (int, error) {
 	n, err := c.stdin.Write(p)
-	if c.cmd != nil {
+	if c.cmd != nil || c.wait != nil {
 		c.d.WireOut.Add(int64(n))
 	}
 	return n, err
@@ -138,7 +168,13 @@ func (c *Conn) Close() error {
 			defer c.stop()
 		}
 		if c.cmd == nil {
-			c.err = c.stdout.Close()
+			if c.wait != nil {
+				_ = c.stdin.Close()
+				_ = c.stdout.Close()
+				c.err = c.wait()
+			} else {
+				c.err = c.stdout.Close()
+			}
 			return
 		}
 		_ = c.stdin.Close()
@@ -212,7 +248,7 @@ func (d *Dialer) sshArgs(worker bool, idx int) []string {
 	} else {
 		args = append(args, "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "ControlPersist=no")
 	}
-	if worker {
+	if worker || d.opt.NonInteractive {
 		// Interactive auth happens once, on the primary connection.
 		args = append(args, "-o", "BatchMode=yes")
 	}
@@ -269,6 +305,9 @@ func (d *Dialer) Dial(ctx context.Context, worker bool, idx int) (*Conn, error) 
 			return nil, ctx.Err()
 		}
 	}
+	if d.ep.Host == "" {
+		return d.local(ctx)
+	}
 	c, need, err := d.start(ctx, worker, idx)
 	if err != nil {
 		return nil, err
@@ -293,20 +332,13 @@ func (d *Dialer) Dial(ctx context.Context, worker bool, idx int) (*Conn, error) 
 }
 
 func (d *Dialer) command(ctx context.Context, worker bool, idx int, debugFile string) (*exec.Cmd, error) {
-	if d.ep.Host == "" {
-		self, err := os.Executable()
-		if err != nil {
-			return nil, err
-		}
-		return process.CommandContext(ctx, self, "serve"), nil
-	}
 	script := fmt.Sprintf(`p="%s"; if [ -x "$p" ]; then exec "$p" serve; fi; echo "RIFT-NEED $(uname -s) $(uname -m)"`, d.remoteBin())
 	args := d.sshArgs(worker, idx)
 	if debugFile != "" {
 		args = append(args, "-vv", "-E", debugFile)
 	}
 	args = append(args, d.ep.Host, "sh -c '"+script+"'")
-	if !worker {
+	if !worker && !d.opt.NonInteractive {
 		return process.CommandContextForeground(ctx, d.opt.SSH, args...), nil
 	}
 	return process.CommandContext(ctx, d.opt.SSH, args...), nil
@@ -341,7 +373,7 @@ func (d *Dialer) start(ctx context.Context, worker bool, idx int) (*Conn, string
 		c.stderr = &stderrBuffer{}
 		cmd.Stderr = c.stderr
 	} else {
-		cmd.Stderr = os.Stderr
+		cmd.Stderr = d.log
 	}
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
@@ -414,6 +446,12 @@ var SourceDir string
 
 // binaryFor finds or builds a rift binary for goos/goarch.
 func (d *Dialer) binaryFor(ctx context.Context, goos, goarch string) (string, error) {
+	if d.opt.ServerBinaries != nil {
+		if path := d.opt.ServerBinaries[goos+"/"+goarch]; path != "" {
+			return path, nil
+		}
+		return "", fmt.Errorf("no receiver binary supplied for %s/%s", goos, goarch)
+	}
 	self, err := os.Executable()
 	if err != nil {
 		return "", err
@@ -443,12 +481,13 @@ func (d *Dialer) binaryFor(ctx context.Context, goos, goarch string) (string, er
 	if _, err := os.Stat(out); err == nil {
 		return out, nil
 	}
-	fmt.Fprintf(os.Stderr, "rift: cross-compiling server for %s/%s...\n", goos, goarch)
+	// Diagnostics are best effort; writer failures do not change the transfer.
+	_, _ = fmt.Fprintf(d.log, "rift: cross-compiling server for %s/%s...\n", goos, goarch)
 	cmd := process.CommandContext(ctx, gobin, "build", "-trimpath", "-ldflags=-s -w", "-o", out,
 		"./cmd/rift")
 	cmd.Dir = src
 	cmd.Env = append(os.Environ(), "GOOS="+goos, "GOARCH="+goarch, "CGO_ENABLED=0")
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = d.log
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("cross-compile: %w", err)
 	}
@@ -485,16 +524,19 @@ func (d *Dialer) deploy(ctx context.Context, need string) error {
 	if err := zw.Close(); err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "rift: installing server on %s (%s/%s, %.1f MiB)\n", d.ep.Host, goos,
+	_, _ = fmt.Fprintf(d.log, "rift: installing server on %s (%s/%s, %.1f MiB)\n", d.ep.Host, goos,
 		goarch, float64(gz.Len())/(1<<20))
 	tmp := remoteDir + "/.rift-" + d.opt.BuildID + ".$$"
 	script := fmt.Sprintf(`mkdir -p "%s" && gzip -dc > "%s" && chmod 755 "%s" && mv -f "%s" "%s"`,
 		remoteDir, tmp, tmp, tmp, d.remoteBin())
 	args := append(d.sshArgs(false, 0), d.ep.Host, "sh -c '"+script+"'")
-	cmd := process.CommandContextForeground(ctx, d.opt.SSH, args...)
+	cmd := process.CommandContext(ctx, d.opt.SSH, args...)
+	if !d.opt.NonInteractive {
+		cmd = process.CommandContextForeground(ctx, d.opt.SSH, args...)
+	}
 	cmd.Stdin = &gz
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = d.log
+	cmd.Stderr = d.log
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("deploy to %s: %w", d.ep.Host, err)
 	}

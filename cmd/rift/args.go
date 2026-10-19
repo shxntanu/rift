@@ -3,9 +3,10 @@ package main
 import (
 	"fmt"
 	"math"
-	"path"
 	"strconv"
 	"strings"
+
+	"github.com/shxntanu/rift/internal/client"
 )
 
 // config is the parsed command line.
@@ -256,17 +257,7 @@ func parseArgs(args []string) (*config, error) {
 // destRoot applies rsync's trailing-slash rule: "src/" syncs the contents
 // of src into dest, while "src" syncs src itself into dest/src.
 func destRoot(src, dest string) string {
-	if strings.HasSuffix(src, "/") {
-		return dest
-	}
-	base := path.Base(src)
-	if base == "." || base == "/" {
-		return dest
-	}
-	if dest == "" {
-		return base
-	}
-	return strings.TrimRight(dest, "/") + "/" + base
+	return client.DestinationRoot(src, dest)
 }
 
 func parseSize(s string) (int64, error) {

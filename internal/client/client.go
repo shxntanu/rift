@@ -12,7 +12,6 @@ import (
 	"math"
 	"os"
 	"path"
-	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -254,13 +253,15 @@ func run(ctx context.Context, opt Options, runner *Runner) (*Summary, error) {
 	if opt.Log == nil {
 		opt.Log = os.Stderr
 	}
+	opt.Transport.Log = opt.Log
 	if opt.Conns < 1 {
 		opt.Conns = 1
 	}
-	src, err := filepath.Abs(opt.Src)
+	src, dst, err := validatePaths(opt.Src, opt.Dst)
 	if err != nil {
 		return nil, err
 	}
+	opt.Dst = dst
 	s := &session{
 		opt:    opt,
 		id:     newSessionID(),
@@ -275,6 +276,9 @@ func run(ctx context.Context, opt Options, runner *Runner) (*Summary, error) {
 	if runner != nil && !opt.Transport.Direct {
 		s.dialer = runner.dialer
 	}
+	s.dialer.SetLog(opt.Log)
+	s.opt.Log = s.dialer.Log()
+	defer s.dialer.SetLog(io.Discard)
 	wireOut, wireIn := s.dialer.WireOut.Load(), s.dialer.WireIn.Load()
 	s.wireStart = wireOut
 	ctx, cancel := context.WithCancel(ctx)
@@ -441,11 +445,12 @@ func run(ctx context.Context, opt Options, runner *Runner) (*Summary, error) {
 		Deleted:       len(p.deletes),
 	}
 	if opt.DryRun {
-		p.print(opt.Log)
-		sum.Transferred = int64(len(p.transfers))
-		for _, f := range p.transfers {
-			sum.Bytes += f.e.Size
-		}
+		p.print(s.opt.Log)
+		sum.Transferred = int64(len(p.transfers) + len(p.sigs) + len(p.symlinks))
+		sum.Bytes = s.st.bytesTotal.Load()
+		s.errMu.Lock()
+		sum.Errors, sum.ErrorCount = append([]string(nil), s.errs...), s.errCount
+		s.errMu.Unlock()
 		sum.Elapsed = time.Since(start)
 		sum.Conns = 1
 		return sum, nil
