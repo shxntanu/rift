@@ -219,6 +219,12 @@ agent and sessions available for later transfers. Watch mode also requires
 `--persist` to reuse sessions between syncs. If both persistence flags are
 given, the last one wins.
 
+Run `rift cleanup` to stop all of your persistent rift agents and rift SSH
+masters, including those left by older builds. This interrupts transfers using
+those sessions and closes their remote server streams. It removes stale sockets
+from `~/.rift` while keeping installed binaries, logs and lock files.
+Use `rift cleanup --dry-run` to preview the process and socket counts.
+
 Use `rift --rich ./ me@server:/code/project` for live progress bars, file
 names, transfer speed and ETA. The TUI uses Bubble Tea and Bubbles progress
 bars. Active files appear first; queued and completed files fill the remaining

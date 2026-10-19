@@ -5,9 +5,11 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -17,6 +19,14 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	if ready := os.Getenv("RIFT_TEST_CLEANUP_STUB"); ready != "" {
+		signal.Ignore(syscall.SIGTERM)
+		if err := os.WriteFile(ready, nil, 0600); err != nil {
+			os.Exit(1)
+		}
+		time.Sleep(time.Hour)
+		os.Exit(0)
+	}
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "serve":
@@ -25,11 +35,16 @@ func TestMain(m *testing.M) {
 			}
 			os.Exit(0)
 		case "__agent":
+			if build := os.Getenv("RIFT_TEST_AGENT_BUILD"); build != "" {
+				buildID = build
+			}
 			idle := agentIdle
 			if os.Getenv("RIFT_TEST_AGENT") == "1" {
 				idle = 250 * time.Millisecond
 			}
-			if err := serveAgentFor(context.Background(), idle); err != nil {
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			if err := serveAgentFor(ctx, idle); err != nil {
 				os.Exit(1)
 			}
 			os.Exit(0)

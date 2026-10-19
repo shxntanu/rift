@@ -39,6 +39,7 @@ Usage:
   rift [OPTIONS] SRC [USER@]HOST:DEST
   rift [OPTIONS] SRC DEST
   rift watch [OPTIONS] SRC [USER@]HOST:DEST
+  rift cleanup [-n|--dry-run] [-q|--quiet]
 
 Like rsync, "SRC/" copies the contents of SRC into DEST while "SRC" copies
 the directory itself to DEST/SRC. The remote side installs itself into
@@ -149,7 +150,8 @@ func (stdio) Close() error                { return os.Stdout.Close() }
 
 func run(args []string) int {
 	watch := len(args) > 0 && args[0] == "watch"
-	if watch {
+	cleanup := len(args) > 0 && args[0] == "cleanup"
+	if watch || cleanup {
 		args = args[1:]
 	}
 	cfg, err := parseArgs(args)
@@ -167,6 +169,9 @@ func run(args []string) int {
 		printLogo(os.Stdout)
 		fmt.Printf("rift %s (protocol %d, build %s)\n", version, proto.Version, getBuildID())
 		return 0
+	}
+	if cleanup {
+		return runCleanup(cfg)
 	}
 	if len(cfg.pos) != 2 {
 		if len(cfg.pos) > 2 {

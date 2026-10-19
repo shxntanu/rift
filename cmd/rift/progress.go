@@ -9,12 +9,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/shxntanu/rift/internal/client"
+
 	"charm.land/bubbles/v2/progress"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/colorprofile"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/shxntanu/rift/internal/client"
 )
 
 // richProgress keeps terminal rendering in the foreground, including when an
