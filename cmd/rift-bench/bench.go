@@ -255,6 +255,8 @@ func (b *bench) syncTo(t tool, src, dir, label string) (time.Duration, error) {
 		}
 		if b.cold {
 			args = append(args, "--no-persist")
+		} else {
+			args = append(args, "--persist")
 		}
 		args = append(args, b.commonArgs()...)
 		args = append(args, b.riftArgs...)

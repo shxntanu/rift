@@ -5,11 +5,24 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/shxntanu/rift/internal/direct"
 )
+
+func TestOneShotSSHDisablesPersistence(t *testing.T) {
+	d := NewDialer(Endpoint{Host: "test"}, Options{})
+	for _, worker := range []bool{false, true} {
+		args := d.sshArgs(worker, 0)
+		for _, option := range []string{"ControlMaster=no", "ControlPath=none", "ControlPersist=no"} {
+			if !slices.Contains(args, option) {
+				t.Errorf("worker=%v: missing %s in %v", worker, option, args)
+			}
+		}
+	}
+}
 
 func TestSSHWindowDiagnostics(t *testing.T) {
 	for _, tc := range []struct {

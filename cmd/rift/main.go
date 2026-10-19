@@ -80,8 +80,9 @@ rift options:
                            deletes ignored files or .git on the receiver
       --delta-min=SIZE     delta-transfer changed files at least SIZE (128K)
       --no-fast-cipher     don't prefer AES-GCM for ssh
-      --no-persist         disable the persistent agent and warm servers
+      --persist            keep the agent and server sessions for reuse
                            (agent exits after 15 idle minutes)
+      --no-persist         close sessions after each sync (default)
 `
 
 func main() {
@@ -241,7 +242,7 @@ func run(args []string) int {
 			SSHArgs:    sshFields[1:],
 			FastCipher: !cfg.noFastCipher,
 			BuildID:    getBuildID(),
-			Persist:    !cfg.noPersist,
+			Persist:    cfg.persist,
 			PersistFor: "15m",
 		},
 		Log: os.Stderr,
@@ -266,7 +267,7 @@ func run(args []string) int {
 				syncOpt.OnProgress = display.Update
 				display.Update(client.Progress{Phase: "Starting sync"})
 			}
-			if cfg.noPersist {
+			if !cfg.persist {
 				return client.Run(ctx, syncOpt)
 			}
 			return runAgentClient(ctx, syncOpt)

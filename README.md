@@ -49,8 +49,8 @@ I would just stop it and think of resuming this activity it some other day.
 
 ## Benchmarks
 
-Every run is warm: the page cache is hot, and rift reuses its
-persistent SSH connections.
+Every benchmark run is warm: the page cache is hot, and rift uses `--persist`
+to reuse its SSH connections.
 
 | Scenario   |   rsync |    rift |      |
 | ---------- | ------: | ------: | ---: |
@@ -67,7 +67,7 @@ repository.
 | Optimization                | What it does                                                                                                                                                 |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Automatic deployment        | Starts the same binary on the remote over SSH; installs a matching server when needed.                                                                       |
-| Persistent agent            | Reuses server processes, compression streams and watched scans; exits after 15 idle minutes. Disable with `--no-persist`.                                    |
+| Persistent agent            | Opt in with `--persist` to reuse server processes, compression streams and watched scans; exits after 15 idle minutes.                                     |
 | Safe session reuse          | Queues simultaneous syncs, resets connections when destinations change, and starts a matching agent after rebuilds.                                          |
 | Watch mode                  | `rift watch --delete ./ me@server:/code/project` syncs after saves, checking every 100 ms.                                                                   |
 | Incremental scans           | Uses inotify on Linux and FSEvents on macOS to re-scan changed directories; falls back to full walks when needed.                                            |
@@ -80,7 +80,7 @@ repository.
 | Adaptive connection count   | Uses planned work, hello RTT and the SSH window to size the pool: up to 8 on low-latency links, 32 otherwise.                                                |
 | SSH window detection        | Reads advertised windows when available; otherwise assumes 2 MiB, or skips fixed-window sizing for identified HPN builds.                                    |
 | Independent SSH connections | Gives each connection its own TCP window and encryption process; prefers hardware-accelerated AES-GCM.                                                       |
-| Warm SSH fallback           | Keeps separate ControlMaster sockets for 15 minutes so restarting a server can skip SSH handshakes.                                                          |
+| Warm SSH fallback           | With `--persist`, keeps separate ControlMaster sockets for 15 minutes so restarting a server can skip SSH handshakes.                                       |
 | Small-file read-ahead       | 24 readers feed connection workers independently, bounded by 64 MiB and 1,024 files.                                                                         |
 | Batched small files         | Sends files up to 1 MiB with their metadata in one message; creates new files with final permissions.                                                        |
 | Parallel large files        | Schedules largest files first and writes 1 MiB chunks into shared temporary files across connections.                                                        |
@@ -209,8 +209,15 @@ rift's own options:
     --gitignore         send exactly what git would (see below)
     --delta-min=SIZE    smallest file to delta-transfer (default 128K)
     --no-fast-cipher    don't ask SSH for AES-GCM
-    --no-persist        disable the agent and warm server sessions
+    --persist           keep the agent and server sessions for reuse (15 min idle)
+    --no-persist        close sessions after each sync (default)
 ```
+
+Transfers are one-shot by default: server processes and connections close when
+the sync finishes. Use `rift --persist ./ me@server:/code/project` to keep the
+agent and sessions available for later transfers. Watch mode also requires
+`--persist` to reuse sessions between syncs. If both persistence flags are
+given, the last one wins.
 
 Use `rift --rich ./ me@server:/code/project` for live progress bars, file
 names, transfer speed and ETA. The TUI uses Bubble Tea and Bubbles progress

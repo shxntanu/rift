@@ -178,8 +178,8 @@ func (d *Dialer) sshArgs(worker bool, idx int) []string {
 			"-o", "ControlMaster=auto",
 			"-o", fmt.Sprintf("ControlPath=%s/%%C-%d", dir, idx),
 			"-o", "ControlPersist="+d.opt.PersistFor)
-	} else if worker {
-		args = append(args, "-o", "ControlMaster=no", "-o", "ControlPath=none")
+	} else {
+		args = append(args, "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "ControlPersist=no")
 	}
 	if worker {
 		// Interactive auth happens once, on the primary connection.

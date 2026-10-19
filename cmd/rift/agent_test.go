@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -35,6 +36,34 @@ func TestMain(m *testing.M) {
 		}
 	}
 	os.Exit(m.Run())
+}
+
+func TestDefaultSyncDoesNotStartAgent(t *testing.T) {
+	for _, args := range [][]string{nil, {"--no-persist"}, {"--persist", "--no-persist"}} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			src, dst := t.TempDir(), t.TempDir()
+			if err := os.WriteFile(filepath.Join(src, "file"), []byte("one shot"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			args = append(append([]string{"--quiet"}, args...), src+"/", dst)
+			if code := run(args); code != 0 {
+				t.Fatalf("sync exited with %d", code)
+			}
+			data, err := os.ReadFile(filepath.Join(dst, "file"))
+			if err != nil || string(data) != "one shot" {
+				t.Fatalf("copy failed: %q, %v", data, err)
+			}
+			entries, err := os.ReadDir(home)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("one-shot sync created persistent state: %v", entries)
+			}
+		})
+	}
 }
 
 func TestAgentConcurrentStartupAndIdleExit(t *testing.T) {
@@ -80,12 +109,8 @@ func TestAgentConcurrentStartupAndIdleExit(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(src, "file"), []byte("saved"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	sum, err := runAgentClient(ctx, opt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if sum.ErrorCount != 0 {
-		t.Fatal(sum.Errors)
+	if code := run([]string{"--persist", "--quiet", src + "/", dst}); code != 0 {
+		t.Fatalf("explicit persistent sync exited with %d", code)
 	}
 	data, err := os.ReadFile(filepath.Join(dst, "file"))
 	if err != nil {

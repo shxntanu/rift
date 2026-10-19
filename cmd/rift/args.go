@@ -25,7 +25,7 @@ type config struct {
 	ignoreExisting bool
 	gitignore      bool
 	noFastCipher   bool
-	noPersist      bool
+	persist        bool
 	direct         bool
 	modifyWindow   int64
 	deltaMin       int64
@@ -159,7 +159,8 @@ var longOpts = map[string]option{
 	"conns":          intArg(func(c *config) *int { return &c.conns }),
 	"gitignore":      flag(func(c *config) { c.gitignore = true }),
 	"no-fast-cipher": flag(func(c *config) { c.noFastCipher = true }),
-	"no-persist":     flag(func(c *config) { c.noPersist = true }),
+	"persist":        flag(func(c *config) { c.persist = true }),
+	"no-persist":     flag(func(c *config) { c.persist = false }),
 	"delta-min": arg(func(c *config, v string) error {
 		n, err := parseSize(v)
 		c.deltaMin = n

@@ -62,7 +62,7 @@ func TestSyncPipelines(t *testing.T) {
 				t.Helper()
 				ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 				defer cancel()
-				args := []string{"--no-persist", "--conns=" + strconv.Itoa(tc.conns), "--compress-level=" + strconv.Itoa(tc.compress), "--delete"}
+				args := []string{"--conns=" + strconv.Itoa(tc.conns), "--compress-level=" + strconv.Itoa(tc.compress), "--delete"}
 				if tc.direct {
 					args = append(args, "--direct")
 				}
