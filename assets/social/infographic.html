@@ -1,0 +1,116 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; background: #1c1917; }
+  body { width: 1600px; height: 1000px; overflow: hidden; }
+  svg { display: block; }
+  text { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+</style>
+</head>
+<body>
+<svg id="c" xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000" shape-rendering="crispEdges"></svg>
+<script>
+const W = 1600, H = 1000, M = 100;
+const svg = document.getElementById('c');
+const NS = 'http://www.w3.org/2000/svg';
+const el = (tag, attrs, parent = svg) => {
+  const n = document.createElementNS(NS, tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  parent.appendChild(n);
+  return n;
+};
+
+const lerp = (a, b, t) => a + (b - a) * t;
+const hex = c => [1, 3, 5].map(i => parseInt(c.slice(i, i + 2), 16));
+const mix = (a, b, t) => {
+  const A = hex(a), B = hex(b);
+  return '#' + A.map((v, i) => Math.round(lerp(v, B[i], t)).toString(16).padStart(2, '0')).join('');
+};
+const AMBER = '#ffb627', ORANGE = '#ff5d1f';
+const grad = t => mix(AMBER, ORANGE, Math.max(0, Math.min(1, t)));
+
+el('rect', { x: 0, y: 0, width: W, height: H, fill: '#1c1917' });
+
+// faint pixel grid
+for (let y = 14; y < H; y += 36)
+  for (let x = 14; x < W; x += 36)
+    el('rect', { x, y, width: 2, height: 2, fill: '#2a2522' });
+
+// icon, with a soft glow behind it
+const ICON = 456, iconX = 1050, iconY = (H - ICON) / 2;
+const defs = el('defs', {});
+const rg = el('radialGradient', { id: 'glow' }, defs);
+el('stop', { offset: '0%', 'stop-color': ORANGE, 'stop-opacity': 0.22 }, rg);
+el('stop', { offset: '45%', 'stop-color': AMBER, 'stop-opacity': 0.06 }, rg);
+el('stop', { offset: '100%', 'stop-color': AMBER, 'stop-opacity': 0 }, rg);
+el('circle', { cx: iconX + ICON / 2, cy: iconY + ICON / 2, r: ICON * 0.95, fill: 'url(#glow)', 'shape-rendering': 'auto' });
+el('image', { href: '../icon.svg', x: iconX, y: iconY, width: ICON, height: ICON, style: 'image-rendering: pixelated' });
+
+// wordmark + url
+el('image', { href: '../logo.svg', x: M, y: 86, width: 246, height: 72, style: 'image-rendering: pixelated' });
+el('text', { x: W - M, y: 122, fill: '#57534e', 'font-size': 22, 'text-anchor': 'end', 'dominant-baseline': 'middle' }).textContent = 'github.com/shxntanu/rift';
+
+// big pixel "5.8x"
+const GLYPHS = {
+  '5': ['11111', '10000', '11110', '00001', '00001', '10001', '01110'],
+  '8': ['01110', '10001', '10001', '01110', '10001', '10001', '01110'],
+  '.': ['00', '00', '00', '00', '00', '11', '11'],
+  'x': ['00000', '00000', '10001', '01010', '00100', '01010', '10001'],
+};
+const P = 30, word = ['5', '.', '8', 'x'];
+const widths = word.map(c => GLYPHS[c][0].length);
+const totalCols = widths.reduce((a, b) => a + b, 0) + word.length - 1;
+const bx = M, by = 220;
+let col = 0;
+word.forEach((ch, wi) => {
+  const g = GLYPHS[ch];
+  for (let r = 0; r < g.length; r++)
+    for (let c = 0; c < g[r].length; c++)
+      if (g[r][c] === '1') {
+        const gc = col + c;
+        el('rect', { x: bx + gc * P, y: by + r * P, width: P, height: P, fill: grad(gc / (totalCols - 1)) });
+      }
+  col += widths[wi] + 1;
+});
+
+el('text', { x: M + 2, y: by + 7 * P + 52, fill: '#8a837d', 'font-size': 28, 'letter-spacing': 1 }).textContent = 'faster than rsync';
+
+// the race: x-axis is wall-clock time
+const laneX = M + 150, laneMax = 520, cell = 12, gap = 5;
+const rsyncS = 626, riftS = 108;
+const raceY = 562;
+
+const label = (y, s, fill) => { el('text', { x: M, y, fill, 'font-size': 28, 'dominant-baseline': 'middle' }).textContent = s; };
+const time = (x, y, s, fill) => { el('text', { x, y, fill, 'font-size': 28, 'dominant-baseline': 'middle', 'font-weight': 600 }).textContent = s; };
+
+label(raceY + cell / 2, 'rsync', '#78716c');
+const rsyncCells = Math.round(laneMax / (cell + gap));
+for (let i = 0; i < rsyncCells; i++)
+  el('rect', { x: laneX + i * (cell + gap), y: raceY, width: cell, height: cell, fill: '#57534e' });
+time(laneX + rsyncCells * (cell + gap) + 14, raceY + cell / 2, '626s', '#78716c');
+
+const lanes = 8, riftTop = raceY + 64;
+const riftCells = Math.max(1, Math.round(rsyncCells * riftS / rsyncS));
+for (let l = 0; l < lanes; l++) {
+  const y = riftTop + l * (cell + gap);
+  for (let i = 0; i < riftCells; i++)
+    el('rect', { x: laneX + i * (cell + gap), y, width: cell, height: cell, fill: grad(i / Math.max(1, riftCells - 1)) });
+}
+const riftMid = riftTop + (lanes * (cell + gap) - gap) / 2;
+label(riftMid, 'rift', '#fafaf9');
+time(laneX + riftCells * (cell + gap) + 14, riftMid, '108s', ORANGE);
+
+// command
+const cmdY = 838, cmdW = 760;
+el('rect', { x: M, y: cmdY, width: cmdW, height: 68, fill: '#231f1c' });
+el('rect', { x: M, y: cmdY, width: 6, height: 68, fill: ORANGE });
+const cmd = el('text', { x: M + 34, y: cmdY + 35, 'font-size': 28, 'dominant-baseline': 'middle' });
+const span = (s, fill) => { el('tspan', { fill }, cmd).textContent = s; };
+span('$ ', '#57534e');
+span('rift', AMBER);
+span(' -av ./ me@server:/code', '#d6d3d1');
+</script>
+</body>
+</html>
