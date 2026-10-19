@@ -16,6 +16,22 @@ import (
 	"github.com/shxntanu/rift/internal/transport"
 )
 
+func TestWorkerJoinsBeforeShutdown(t *testing.T) {
+	s := &session{sched: newScheduler()}
+	rc := &rconn{s: s, pc: proto.NewConn(nil)}
+	rc.startWork()
+	s.sched.mu.Lock()
+	workers := s.sched.workers
+	s.sched.mu.Unlock()
+	s.sched.close()
+	s.sched.waitWorkers()
+	if workers != 1 {
+		t.Fatalf("worker was not registered before startWork returned: %d", workers)
+	}
+	// Reuse must be safe even if shutdown preceded the worker's first read.
+	rc.s = &session{sched: newScheduler()}
+}
+
 func TestAcknowledgementsOnlyConfirmEarlierFrames(t *testing.T) {
 	rc := &rconn{}
 	rc.recordScan()

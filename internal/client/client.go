@@ -477,7 +477,7 @@ func run(ctx context.Context, opt Options, runner *Runner) (*Summary, error) {
 
 	stopReaders = s.startReaders()
 	s.spawnWorkers(ctx, &spawnWG, p)
-	go ctrl.work()
+	ctrl.startWork()
 	finalBatchFolded := false
 	if s.pushPlan(p) {
 		// Barriers make every server confirm it applied everything; delta

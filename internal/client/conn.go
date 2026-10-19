@@ -601,12 +601,13 @@ func (rc *rconn) dispatch(t proto.Type, p []byte) error {
 	return nil
 }
 
-// work is the worker loop: pull jobs, execute them, repeat.
-func (rc *rconn) work() {
+// startWork registers the worker before launching it so shutdown waits even
+// when the goroutine has not started running yet.
+func (rc *rconn) startWork() {
 	if !rc.s.sched.join() {
 		return
 	}
-	rc.workJoined()
+	go rc.workJoined()
 }
 
 // speculative workers join before starting their reader or
