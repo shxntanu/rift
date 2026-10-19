@@ -8,7 +8,6 @@ import (
 	"io/fs"
 	"math/rand/v2"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -16,6 +15,7 @@ import (
 	"time"
 
 	"github.com/shxntanu/rift/internal/client"
+	"github.com/shxntanu/rift/internal/process"
 )
 
 const bigName = "rift-bench-big.dat"
@@ -58,11 +58,11 @@ func run(ctx context.Context, cfg *config) (err error) {
 	}
 	defer os.RemoveAll(b.tmp)
 
-	rsyncVer, err := firstLine(b.rsyncBin, "--version")
+	rsyncVer, err := firstLine(ctx, b.rsyncBin, "--version")
 	if err != nil {
 		return fmt.Errorf("rsync: %w", err)
 	}
-	riftVer, err := firstLine(b.riftBin, "--version")
+	riftVer, err := firstLine(ctx, b.riftBin, "--version")
 	if err != nil {
 		return fmt.Errorf("rift: %w (build it with make, or pass -rift)", err)
 	}
@@ -96,7 +96,7 @@ func run(ctx context.Context, cfg *config) (err error) {
 			fmt.Printf("\nkept %s:%s\n", b.host, b.remote)
 			return
 		}
-		if _, err := b.remoteSh("rm -rf " + shq(b.remote)); err != nil {
+		if _, err := b.remoteShContext(context.Background(), "rm -rf "+shq(b.remote)); err != nil {
 			fmt.Fprintf(os.Stderr, "rift-bench: removing %s:%s: %v\n", b.host, b.remote, err)
 		}
 	}()
@@ -274,7 +274,7 @@ func (b *bench) syncTo(t tool, src, dir, label string) (time.Duration, error) {
 		return 0, err
 	}
 	defer logf.Close()
-	cmd := exec.CommandContext(b.ctx, bin, args...)
+	cmd := process.CommandContext(b.ctx, bin, args...)
 	cmd.Stdout, cmd.Stderr = logf, logf
 	start := time.Now()
 	err = cmd.Run()
@@ -327,7 +327,7 @@ func (b *bench) warmUp() error {
 // don't hide the changes), otherwise everything outside .git.
 func (b *bench) pickFiles() (tracked bool, err error) {
 	var files []string
-	if out, err := exec.Command("git", "-C", b.local, "ls-files", "-z").Output(); err == nil {
+	if out, err := process.CommandContext(b.ctx, "git", "-C", b.local, "ls-files", "-z").Output(); err == nil {
 		for _, p := range strings.Split(strings.TrimRight(string(out), "\x00"), "\x00") {
 			if fi, err := os.Lstat(filepath.Join(b.local, p)); p != "" && err == nil && fi.Mode().IsRegular() {
 				files = append(files, p)
@@ -484,7 +484,7 @@ func (b *bench) startMaster() error {
 	args = append(append(args, b.sshExtra()...), b.host)
 	// Attached to the terminal so password or host-key prompts work; the
 	// master detaches once authenticated.
-	cmd := exec.CommandContext(b.ctx, b.sshProg, args...)
+	cmd := process.CommandContextForeground(b.ctx, b.sshProg, args...)
 	cmd.Stdin, cmd.Stderr = os.Stdin, os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("ssh %s: %w", b.host, err)
@@ -495,7 +495,9 @@ func (b *bench) startMaster() error {
 func (b *bench) stopMaster() {
 	args := append(slices.Clone(b.sshOpts), "-o", "ControlPath="+b.sock, "-O", "exit")
 	args = append(append(args, b.sshExtra()...), b.host)
-	cmd := exec.Command(b.sshProg, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := process.CommandContext(ctx, b.sshProg, args...)
 	_ = cmd.Run()
 	os.Remove(b.sock)
 }
@@ -522,12 +524,16 @@ func (b *bench) rsyncSSH() []string {
 // remoteSh runs a POSIX sh script on the remote over the master connection,
 // independent of the user's login shell. Cleanup still runs after Ctrl-C.
 func (b *bench) remoteSh(script string) (string, error) {
+	return b.remoteShContext(b.ctx, script)
+}
+
+func (b *bench) remoteShContext(ctx context.Context, script string) (string, error) {
 	args := append(slices.Clone(b.sshOpts), "-o", "ControlMaster=no", "-o", "ControlPath="+b.sock)
 	args = append(append(args, b.sshExtra()...), b.host, "sh -c "+shq(script))
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 	var out, errb bytes.Buffer
-	cmd := exec.CommandContext(ctx, b.sshProg, args...)
+	cmd := process.CommandContext(ctx, b.sshProg, args...)
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("%v: %s", err, strings.TrimSpace(errb.String()))
@@ -654,7 +660,7 @@ func cloneTree(ctx context.Context, src, dst string) error {
 	for _, flags := range tries {
 		os.RemoveAll(dst)
 		var out []byte
-		out, err = exec.CommandContext(ctx, "cp", append(flags, src, dst)...).CombinedOutput()
+		out, err = process.CommandContext(ctx, "cp", append(flags, src, dst)...).CombinedOutput()
 		if err == nil {
 			return nil
 		}
@@ -681,8 +687,8 @@ func treeStats(root string) (files int, size int64, err error) {
 	return
 }
 
-func firstLine(bin string, args ...string) (string, error) {
-	out, err := exec.Command(bin, args...).CombinedOutput()
+func firstLine(ctx context.Context, bin string, args ...string) (string, error) {
+	out, err := process.CommandContext(ctx, bin, args...).CombinedOutput()
 	if err != nil {
 		return "", err
 	}

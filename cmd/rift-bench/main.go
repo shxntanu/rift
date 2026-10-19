@@ -14,12 +14,12 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
-	"syscall"
+
+	"github.com/shxntanu/rift/internal/process"
 )
 
 const usage = `rift-bench - benchmark rift against rsync
@@ -60,7 +60,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "rift-bench:", err)
 		os.Exit(2)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := process.NotifyContext(context.Background())
 	defer stop()
 	if err := run(ctx, cfg); err != nil {
 		if ctx.Err() != nil {

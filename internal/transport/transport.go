@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/shxntanu/rift/internal/direct"
+	"github.com/shxntanu/rift/internal/process"
 	"github.com/shxntanu/rift/internal/proto"
 )
 
@@ -90,10 +91,11 @@ func NewDialer(ep Endpoint, opt Options) *Dialer {
 // Conn carries the protocol over a server process or an encrypted TCP stream.
 type Conn struct {
 	stop   func() bool
+	cancel context.CancelFunc
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
-	stderr *bytes.Buffer
+	stderr *stderrBuffer
 	d      *Dialer
 	once   sync.Once
 	err    error
@@ -129,10 +131,13 @@ func (c *Conn) CloseRead() error { return c.stdout.Close() }
 // Close signals EOF to the server and waits briefly for it to exit.
 func (c *Conn) Close() error {
 	c.once.Do(func() {
+		if c.cancel != nil {
+			defer c.cancel()
+		}
+		if c.stop != nil {
+			defer c.stop()
+		}
 		if c.cmd == nil {
-			if c.stop != nil {
-				c.stop()
-			}
 			c.err = c.stdout.Close()
 			return
 		}
@@ -142,11 +147,37 @@ func (c *Conn) Close() error {
 		select {
 		case c.err = <-done:
 		case <-time.After(10 * time.Second):
-			_ = c.cmd.Process.Kill()
-			c.err = <-done
+			killErr := process.Kill(c.cmd)
+			select {
+			case c.err = <-done:
+			case <-time.After(2 * time.Second):
+				// Keep Wait running so the child is reaped if the kernel
+				// eventually releases it, but don't hang shutdown forever.
+				c.err = errors.Join(killErr, fmt.Errorf("PID %d did not exit after SIGKILL; it may be blocked in the kernel", c.cmd.Process.Pid))
+			}
 		}
+		_ = c.stdout.Close()
 	})
 	return c.err
+}
+
+// A process stuck in the kernel can outlive Close's deadline. Synchronize
+// stderr reads with exec's copy goroutine even in that case.
+type stderrBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *stderrBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *stderrBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // Stderr returns whatever the process wrote to stderr (worker connections only).
@@ -206,6 +237,27 @@ func (d *Dialer) controlDir() string {
 // ErrNeedDeploy is returned by worker dials when the remote lacks a binary.
 var ErrNeedDeploy = errors.New("rift is not installed on the remote")
 
+// DialRetained respects ctx during startup, then keeps a successful connection
+// alive until Close or lifetime cancellation, for reuse across requests.
+func (d *Dialer) DialRetained(ctx, lifetime context.Context, worker bool, idx int) (*Conn, error) {
+	owned, cancel := context.WithCancel(lifetime)
+	stop := context.AfterFunc(ctx, cancel)
+	c, err := d.Dial(owned, worker, idx)
+	stop()
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	if err != nil {
+		cancel()
+		if c != nil {
+			_ = c.Close()
+		}
+		return nil, err
+	}
+	c.cancel = cancel
+	return c, nil
+}
+
 // Dial starts a server process. The primary connection (worker=false) may
 // prompt for credentials and deploys the binary if needed.
 func (d *Dialer) Dial(ctx context.Context, worker bool, idx int) (*Conn, error) {
@@ -246,7 +298,7 @@ func (d *Dialer) command(ctx context.Context, worker bool, idx int, debugFile st
 		if err != nil {
 			return nil, err
 		}
-		return exec.CommandContext(ctx, self, "serve"), nil
+		return process.CommandContext(ctx, self, "serve"), nil
 	}
 	script := fmt.Sprintf(`p="%s"; if [ -x "$p" ]; then exec "$p" serve; fi; echo "RIFT-NEED $(uname -s) $(uname -m)"`, d.remoteBin())
 	args := d.sshArgs(worker, idx)
@@ -254,7 +306,10 @@ func (d *Dialer) command(ctx context.Context, worker bool, idx int, debugFile st
 		args = append(args, "-vv", "-E", debugFile)
 	}
 	args = append(args, d.ep.Host, "sh -c '"+script+"'")
-	return exec.CommandContext(ctx, d.opt.SSH, args...), nil
+	if !worker {
+		return process.CommandContextForeground(ctx, d.opt.SSH, args...), nil
+	}
+	return process.CommandContext(ctx, d.opt.SSH, args...), nil
 }
 
 // start launches the process and reads the server magic. If the remote
@@ -278,22 +333,25 @@ func (d *Dialer) start(ctx context.Context, worker bool, idx int) (*Conn, string
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		_ = stdin.Close()
 		return nil, "", err
 	}
 	c := &Conn{cmd: cmd, stdin: stdin, stdout: stdout, d: d}
 	if worker {
-		c.stderr = &bytes.Buffer{}
+		c.stderr = &stderrBuffer{}
 		cmd.Stderr = c.stderr
 	} else {
 		cmd.Stderr = os.Stderr
 	}
-	cmd.Cancel = func() error { return cmd.Process.Kill() }
-	// A backgrounded ssh master could hold inherited pipes open; never let
-	// that stall Wait.
-	cmd.WaitDelay = 2 * time.Second
 	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		_ = stdout.Close()
 		return nil, "", fmt.Errorf("start %s: %w", cmd.Path, err)
 	}
+	// Closing pipes also unblocks a greeting read when a killed wrapper's
+	// descendants inherited them, or when the child is stuck in the kernel.
+	stop := context.AfterFunc(ctx, func() { _ = stdin.Close(); _ = stdout.Close() })
+	c.stop = stop
 	var magic [5]byte
 	if _, err := io.ReadFull(stdout, magic[:]); err != nil {
 		_ = c.Close()
@@ -386,7 +444,7 @@ func (d *Dialer) binaryFor(ctx context.Context, goos, goarch string) (string, er
 		return out, nil
 	}
 	fmt.Fprintf(os.Stderr, "rift: cross-compiling server for %s/%s...\n", goos, goarch)
-	cmd := exec.CommandContext(ctx, gobin, "build", "-trimpath", "-ldflags=-s -w", "-o", out,
+	cmd := process.CommandContext(ctx, gobin, "build", "-trimpath", "-ldflags=-s -w", "-o", out,
 		"./cmd/rift")
 	cmd.Dir = src
 	cmd.Env = append(os.Environ(), "GOOS="+goos, "GOARCH="+goarch, "CGO_ENABLED=0")
@@ -433,7 +491,7 @@ func (d *Dialer) deploy(ctx context.Context, need string) error {
 	script := fmt.Sprintf(`mkdir -p "%s" && gzip -dc > "%s" && chmod 755 "%s" && mv -f "%s" "%s"`,
 		remoteDir, tmp, tmp, tmp, d.remoteBin())
 	args := append(d.sshArgs(false, 0), d.ep.Host, "sh -c '"+script+"'")
-	cmd := exec.CommandContext(ctx, d.opt.SSH, args...)
+	cmd := process.CommandContextForeground(ctx, d.opt.SSH, args...)
 	cmd.Stdin = &gz
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr

@@ -221,7 +221,7 @@ func TestRunCollectsFinalErrorsAtEOF(t *testing.T) {
 	}
 }
 
-func TestCloseWaitsOnlyForUnconfirmedFrames(t *testing.T) {
+func TestCloseReapsServersAndDrainsUnconfirmedFrames(t *testing.T) {
 	for _, mode := range []string{"confirmed", "pending", "truncated"} {
 		t.Run(mode, func(t *testing.T) {
 			dir := t.TempDir()
@@ -247,50 +247,37 @@ func TestCloseWaitsOnlyForUnconfirmedFrames(t *testing.T) {
 			}
 			done := make(chan error, 1)
 			go func() { done <- rc.close() }()
-			if mode == "confirmed" {
-				select {
-				case err := <-done:
-					if err != nil {
-						t.Fatal(err)
-					}
-				case <-time.After(time.Second):
-					t.Fatal("confirmed connection waited for the server to exit")
+			deadline := time.Now().Add(time.Second)
+			for {
+				if _, err := os.Stat(gate + ".ready"); err == nil {
+					break
 				}
-			} else {
-				deadline := time.Now().Add(time.Second)
-				for {
-					if _, err := os.Stat(gate + ".ready"); err == nil {
-						break
-					}
-					if time.Now().After(deadline) {
-						t.Fatal("server did not receive EOF")
-					}
-					time.Sleep(time.Millisecond)
+				if time.Now().After(deadline) {
+					t.Fatal("server did not receive EOF")
 				}
-				select {
-				case err := <-done:
-					t.Fatalf("unconfirmed connection closed before server EOF: %v", err)
-				default:
-				}
+				time.Sleep(time.Millisecond)
+			}
+			select {
+			case err := <-done:
+				t.Fatalf("connection returned before reaping server: %v", err)
+			default:
 			}
 			if err := os.WriteFile(gate, nil, 0o600); err != nil {
 				t.Fatal(err)
 			}
-			if mode != "confirmed" {
-				select {
-				case err := <-done:
-					if mode == "truncated" {
-						if !errors.Is(err, io.ErrUnexpectedEOF) {
-							t.Fatalf("truncated teardown error = %v", err)
-						}
-					} else if err != nil {
-						t.Fatal(err)
-					} else if rc.s.errCount != 1 || rc.s.errs[0] != "remote: final metadata failed" {
-						t.Fatalf("lost final server error: %v", rc.s.errs)
+			select {
+			case err := <-done:
+				if mode == "truncated" {
+					if !errors.Is(err, io.ErrUnexpectedEOF) {
+						t.Fatalf("truncated teardown error = %v", err)
 					}
-				case <-time.After(3 * time.Second):
-					t.Fatal("connection did not close after server exit")
+				} else if err != nil {
+					t.Fatal(err)
+				} else if mode != "confirmed" && (rc.s.errCount != 1 || rc.s.errs[0] != "remote: final metadata failed") {
+					t.Fatalf("lost final server error: %v", rc.s.errs)
 				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("connection did not close after server exit")
 			}
 			if err := tc.Close(); err != nil && mode != "confirmed" {
 				t.Fatal(err)

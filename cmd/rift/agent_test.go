@@ -16,6 +16,7 @@ import (
 	"github.com/shxntanu/rift/internal/client"
 	"github.com/shxntanu/rift/internal/server"
 	"github.com/shxntanu/rift/internal/transport"
+	"golang.org/x/sys/unix"
 )
 
 func TestMain(m *testing.M) {
@@ -51,6 +52,39 @@ func TestMain(m *testing.M) {
 		}
 	}
 	os.Exit(m.Run())
+}
+
+func TestAgentStartupLockCancellation(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "rift-agent-lock-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(home)
+	t.Setenv("HOME", home)
+	dir, err := agentDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.OpenFile(filepath.Join(dir, "agent.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- serveAgentFor(ctx, agentIdle) }()
+	select {
+	case err := <-done:
+		if err != context.DeadlineExceeded {
+			t.Fatalf("lock wait returned %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("agent ignored cancellation while waiting for its startup lock")
+	}
 }
 
 func TestDefaultSyncDoesNotStartAgent(t *testing.T) {

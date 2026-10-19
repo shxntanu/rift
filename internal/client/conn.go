@@ -196,11 +196,13 @@ func (s *session) connect(ctx context.Context, worker bool, id int, scanSpecs fu
 			return rc, nil
 		}
 	}
-	dialCtx := ctx
+	var tc *transport.Conn
+	var err error
 	if s.runner != nil && !s.opt.Transport.Direct {
-		dialCtx = s.runner.ctx
+		tc, err = s.dialer.DialRetained(ctx, s.runner.ctx, worker, id)
+	} else {
+		tc, err = s.dialer.Dial(ctx, worker, id)
 	}
-	tc, err := s.dialer.Dial(dialCtx, worker, id)
 	if err != nil {
 		return nil, err
 	}
@@ -418,12 +420,12 @@ func (rc *rconn) close() error {
 		}
 		werr := rc.pc.CloseWrite()
 		if !pending {
-			// all server errors precede the last ack. Stop
-			// reading and reap in the background to skip the server-exit RTT.
+			// All server errors precede the last ack. Stop reading, but
+			// reap before returning: the foreground client may exit next.
 			_ = rc.tc.CloseRead()
 			<-rc.dead
 			rc.closeErr = rc.rerr
-			go func() { _ = rc.pc.Close() }()
+			_ = rc.pc.Close()
 			return
 		}
 		// EOF replaces the final barrier for pending deletes

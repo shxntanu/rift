@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/shxntanu/rift/internal/direct"
+	"github.com/shxntanu/rift/internal/process"
 	"github.com/shxntanu/rift/internal/proto"
 )
 
@@ -22,7 +22,7 @@ func (d *Dialer) UseDirect(ctx context.Context, control *Conn, offer direct.Offe
 		// Respect SSH Host aliases and HostName without guessing from user@host.
 		args := append([]string{"-G"}, d.opt.SSHArgs...)
 		args = append(args, d.ep.Host)
-		out, err := exec.CommandContext(ctx, d.opt.SSH, args...).Output()
+		out, err := process.CommandContext(ctx, d.opt.SSH, args...).Output()
 		if err != nil {
 			return nil, fmt.Errorf("resolve direct SSH host: %w", err)
 		}

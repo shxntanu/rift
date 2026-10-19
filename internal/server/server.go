@@ -29,6 +29,7 @@ import (
 )
 
 type server struct {
+	ctx                     context.Context
 	listener                *direct.Listener
 	boundRoot, boundSession string
 	raw                     io.ReadWriteCloser
@@ -62,11 +63,20 @@ type deltaState struct {
 }
 
 // Serve runs one server session over rw until the client disconnects.
-func Serve(rw io.ReadWriteCloser) error { return serve(rw, "", "") }
+func Serve(rw io.ReadWriteCloser) error { return ServeContext(context.Background(), rw) }
+
+// ServeContext runs a server session and closes its stream on cancellation.
+func ServeContext(ctx context.Context, rw io.ReadWriteCloser) error {
+	return serve(ctx, rw, "", "")
+}
 
 var setUmask sync.Once
 
-func serve(rw io.ReadWriteCloser, root, session string) error {
+func serve(ctx context.Context, rw io.ReadWriteCloser, root, session string) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(ctx, func() { _ = rw.Close() })
+	defer stop()
 	if _, err := io.WriteString(rw, proto.Magic); err != nil {
 		return err
 	}
@@ -74,6 +84,7 @@ func serve(rw io.ReadWriteCloser, root, session string) error {
 	// a chmod per file.
 	setUmask.Do(func() { unix.Umask(0) })
 	s := &server{
+		ctx:       ctx,
 		raw:       rw,
 		boundRoot: root, boundSession: session,
 		c:      proto.NewConn(rw),
@@ -163,7 +174,7 @@ func (s *server) handshake() error {
 	if wantDirect {
 		// Only the SSH-authorized root and session are valid on this listener.
 		root, session := s.root, s.session
-		listener, listenErr := direct.Listen(func(c *direct.Conn) { _ = serve(c, root, session) })
+		listener, listenErr := direct.Listen(func(c *direct.Conn) { _ = serve(s.ctx, c, root, session) })
 		if listenErr == nil {
 			s.listener = listener
 		} // A blocked listener falls back to SSH.
@@ -300,7 +311,7 @@ func (s *server) scan(d *proto.Dec) error {
 	if s.cache == nil {
 		s.cache = scan.NewCache(s.root)
 	}
-	res, err := s.cache.Scan(context.Background(), filter)
+	res, err := s.cache.Scan(s.ctx, filter)
 	if err != nil {
 		return err
 	}

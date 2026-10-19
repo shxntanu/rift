@@ -6,19 +6,19 @@ import (
 	"context"
 	_ "embed"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"runtime/debug"
 	"runtime/pprof"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/shxntanu/rift/internal/client"
+	"github.com/shxntanu/rift/internal/process"
 	"github.com/shxntanu/rift/internal/proto"
 	"github.com/shxntanu/rift/internal/scan"
 	"github.com/shxntanu/rift/internal/server"
@@ -101,7 +101,9 @@ func main() {
 	}
 	if len(os.Args) > 1 && os.Args[1] == "serve" {
 		debug.SetGCPercent(400)
-		if err := server.Serve(stdio{}); err != nil {
+		ctx, stop := process.NotifyContext(context.Background())
+		defer stop()
+		if err := server.ServeContext(ctx, stdio{}); err != nil && ctx.Err() == nil {
 			fmt.Fprintln(os.Stderr, "rift serve:", err)
 			pprof.StopCPUProfile()
 			os.Exit(1)
@@ -109,7 +111,7 @@ func main() {
 		return
 	}
 	if len(os.Args) > 1 && os.Args[1] == "__agent" {
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		ctx, stop := process.NotifyContext(context.Background())
 		defer stop()
 		if err := serveAgent(ctx); err != nil {
 			fmt.Fprintln(os.Stderr, "rift agent:", err)
@@ -146,7 +148,7 @@ type stdio struct{}
 
 func (stdio) Read(p []byte) (int, error)  { return os.Stdin.Read(p) }
 func (stdio) Write(p []byte) (int, error) { return os.Stdout.Write(p) }
-func (stdio) Close() error                { return os.Stdout.Close() }
+func (stdio) Close() error                { return errors.Join(os.Stdin.Close(), os.Stdout.Close()) }
 
 func run(args []string) int {
 	watch := len(args) > 0 && args[0] == "watch"
@@ -253,7 +255,7 @@ func run(args []string) int {
 		Log: os.Stderr,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := process.NotifyContext(context.Background())
 	defer stop()
 	if opt.Rich {
 		printLogo(os.Stderr)

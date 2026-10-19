@@ -5,13 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/shxntanu/rift/internal/process"
 )
 
 type persistentSession struct {
@@ -24,7 +24,7 @@ func runCleanup(cfg *config) int {
 		fmt.Fprintln(os.Stderr, "rift: cleanup takes no source or destination and cannot be combined with --persist")
 		return 1
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := process.NotifyContext(context.Background())
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -66,7 +66,7 @@ func runCleanup(cfg *config) int {
 // Inspect this user's processes rather than the current build's socket: an
 // older agent can still be running after another build replaces agent.sock.
 func persistentSessions(ctx context.Context) ([]persistentSession, error) {
-	out, err := exec.CommandContext(ctx, "ps", "-U", strconv.Itoa(os.Getuid()), "-ww", "-o", "pid=,args=").Output()
+	out, err := process.CommandContext(ctx, "ps", "-U", strconv.Itoa(os.Getuid()), "-ww", "-o", "pid=,args=").Output()
 	if err != nil {
 		return nil, fmt.Errorf("list processes: %w", err)
 	}
@@ -122,9 +122,12 @@ func stopPersistentSessions(ctx context.Context, sessions []persistentSession) e
 	tick := time.NewTicker(50 * time.Millisecond)
 	defer tick.Stop()
 	for len(pending) > 0 {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(errs, fmt.Errorf("processes still present after shutdown (PID: command): %v; processes in UE/kernel wait cannot exit until the kernel releases them: %w", pending, err))
+		}
 		running, err := persistentSessions(ctx)
 		if err != nil {
-			return errors.Join(errs, err)
+			return errors.Join(errs, fmt.Errorf("waiting for processes (PID: command) %v: %w", pending, err))
 		}
 		live := make(map[int]string, len(running))
 		for _, session := range running {
@@ -140,7 +143,7 @@ func stopPersistentSessions(ctx context.Context, sessions []persistentSession) e
 		}
 		select {
 		case <-ctx.Done():
-			return errors.Join(errs, fmt.Errorf("waiting for persistent processes to stop: %w", ctx.Err()))
+			continue // Report the remaining PIDs on the next iteration.
 		case <-grace.C:
 			for pid := range pending {
 				if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {

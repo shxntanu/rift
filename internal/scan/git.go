@@ -12,13 +12,16 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/shxntanu/rift/internal/process"
 )
 
 // GitList lists what git considers the working tree under root: tracked
 // files plus untracked files that are not ignored. This gives exact
 // .gitignore semantics (nested ignores, global excludes, negations) for free.
 func GitList(ctx context.Context, root string, filter *Filter) (*Result, error) {
-	cmd := exec.CommandContext(ctx, "git", "-C", root, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+	cmd := process.CommandContext(ctx, "git", "-C", root, "ls-files", "-z", "--cached",
+		"--others", "--exclude-standard")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -121,7 +124,8 @@ func GitIgnored(ctx context.Context, root string, paths []string) (map[string]bo
 	if len(paths) == 0 {
 		return ignored, nil
 	}
-	cmd := exec.CommandContext(ctx, "git", "-C", root, "check-ignore", "-z", "--stdin", "--no-index")
+	cmd := process.CommandContext(ctx, "git", "-C", root, "check-ignore", "-z", "--stdin",
+		"--no-index")
 	var in bytes.Buffer
 	for _, p := range paths {
 		in.WriteString(p)

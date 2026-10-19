@@ -77,6 +77,8 @@ func dialAgent(ctx context.Context, path, build string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
+	defer stop()
 	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
 	var got string
 	err = json.NewDecoder(c).Decode(&got)
@@ -114,7 +116,20 @@ func connectAgent(ctx context.Context) (net.Conn, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	go func() { _ = cmd.Wait() }()
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	started := false
+	defer func() {
+		if !started {
+			// The agent only becomes persistent once startup succeeds.
+			_ = cmd.Process.Kill()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				// Wait will reap it if a pending kernel wait completes.
+			}
+		}
+	}()
 	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
 	ticker := time.NewTicker(20 * time.Millisecond)
@@ -123,10 +138,18 @@ func connectAgent(ctx context.Context) (net.Conn, error) {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		case err := <-done:
+			started = true // Already reaped; no startup process remains to kill.
+			// A concurrent startup may have won the socket.
+			if c, dialErr := dialAgent(ctx, path, build); dialErr == nil {
+				return c, nil
+			}
+			return nil, fmt.Errorf("agent exited during startup (%v); see %s", err, filepath.Join(dir, "agent.log"))
 		case <-timer.C:
 			return nil, fmt.Errorf("agent startup timed out; see %s", filepath.Join(dir, "agent.log"))
 		case <-ticker.C:
 			if c, err := dialAgent(ctx, path, build); err == nil {
+				started = true
 				return c, nil
 			}
 		}
@@ -177,6 +200,8 @@ func runAgentClient(ctx context.Context, opt client.Options) (*client.Summary, e
 func serveAgent(ctx context.Context) error { return serveAgentFor(ctx, agentIdle) }
 
 func serveAgentFor(ctx context.Context, idle time.Duration) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	dir, err := agentDir()
 	if err != nil {
 		return err
@@ -186,7 +211,7 @@ func serveAgentFor(ctx context.Context, idle time.Duration) error {
 		return err
 	}
 	defer lock.Close()
-	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+	if err := agentLock(ctx, lock); err != nil {
 		return err
 	}
 	path := filepath.Join(dir, "agent.sock")
@@ -220,7 +245,7 @@ func serveAgentFor(ctx context.Context, idle time.Duration) error {
 	var wg sync.WaitGroup
 	stop := context.AfterFunc(ctx, func() { _ = ln.Close() })
 	defer stop()
-	defer wg.Wait()
+	defer func() { cancel(); wg.Wait() }()
 	for {
 		if err := ln.SetDeadline(time.Now().Add(time.Second)); err != nil {
 			return err
@@ -274,20 +299,9 @@ func serveAgentFor(ctx context.Context, idle time.Duration) error {
 				return
 			}
 			defer syncLock.Close()
-			for {
-				err = unix.Flock(int(syncLock.Fd()), unix.LOCK_EX|unix.LOCK_NB)
-				if err == nil {
-					break
-				}
-				if err != unix.EWOULDBLOCK {
-					_ = enc.Encode(agentResponse{Error: err.Error()})
-					return
-				}
-				select {
-				case <-reqCtx.Done():
-					return
-				case <-time.After(20 * time.Millisecond):
-				}
+			if err := agentLock(reqCtx, syncLock); err != nil {
+				_ = enc.Encode(agentResponse{Error: err.Error()})
+				return
 			}
 			// Preserve relative filter files, SSH configuration and git environment.
 			if err := os.Chdir(req.Cwd); err != nil {
@@ -316,5 +330,22 @@ func serveAgentFor(ctx context.Context, idle time.Duration) error {
 			}
 			_ = enc.Encode(res)
 		}()
+	}
+}
+
+func agentLock(ctx context.Context, lock *os.File) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil || (err != unix.EWOULDBLOCK && err != unix.EINTR) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
 }

@@ -225,6 +225,17 @@ those sessions and closes their remote server streams. It removes stale sockets
 from `~/.rift` while keeping installed binaries, logs and lock files.
 Use `rift cleanup --dry-run` to preview the process and socket counts.
 
+Shutdown closes server streams and reaps owned subprocesses before returning.
+Cancellation terminates SSH sessions and helper commands, including their
+children. `SIGINT`, `SIGTERM`, and `SIGHUP` initiate cleanup;
+a second signal uses the default action to force exit. Explicit `--persist`
+sessions remain available until their idle timeout or `rift cleanup`.
+
+`SIGKILL` cannot be caught, so killing rift itself with `kill -9` skips its
+cleanup. macOS processes in `UE` (uninterruptible kernel wait while exiting)
+can remain even after `SIGKILL`; rift cannot force the kernel to release them.
+If they persist after the underlying I/O recovers, a reboot may be needed.
+
 Use `rift --rich ./ me@server:/code/project` for live progress bars, file
 names, transfer speed and ETA. The TUI uses Bubble Tea and Bubbles progress
 bars. Active files appear first; queued and completed files fill the remaining
