@@ -643,6 +643,9 @@ func (rc *rconn) workJoined() {
 }
 
 func (rc *rconn) do(j *job) error {
+	if j.f != nil && j.kind != jobFinalize {
+		j.f.state.Store(fileSending)
+	}
 	switch j.kind {
 	case jobPut:
 		return rc.put(j)
@@ -655,7 +658,7 @@ func (rc *rconn) do(j *job) error {
 		rc.enc.Varint(f.e.Mtime)
 		rc.s.logf(">l %s -> %s", f.e.Path, f.e.Link)
 		rc.s.st.filesDone.Add(1)
-		return rc.send(proto.TSymlink, rc.enc.B)
+		return f.finishProgress(rc.send(proto.TSymlink, rc.enc.B))
 	case jobRange:
 		return rc.sendRange(j.rt)
 	case jobFinalize:
@@ -666,8 +669,9 @@ func (rc *rconn) do(j *job) error {
 		rc.enc.Uvarint(uint64(f.e.Mode))
 		rc.enc.Varint(f.e.Mtime)
 		rc.s.st.filesDone.Add(1)
-		return rc.send(proto.TFinalize, rc.enc.B)
+		return f.finishProgress(rc.send(proto.TFinalize, rc.enc.B))
 	case jobSigReq:
+		j.f.state.Store(fileChecking)
 		rc.enc.Reset()
 		rc.enc.Uvarint(j.f.id)
 		rc.enc.Str(j.f.e.Path)
@@ -697,6 +701,7 @@ func (rc *rconn) put(j *job) error {
 	}
 	data, err := r.data, r.err
 	if err != nil {
+		f.failed.Store(true)
 		s.recordErr(fmt.Sprintf("%s: %v", f.e.Path, err))
 		s.st.bytesDone.Add(f.e.Size)
 		return nil
@@ -715,7 +720,7 @@ func (rc *rconn) put(j *job) error {
 	s.st.bytesDone.Add(f.e.Size)
 	s.st.literal.Add(int64(len(data)))
 	s.st.filesDone.Add(1)
-	return rc.send(proto.TPut, rc.enc.B, data)
+	return f.finishProgress(rc.send(proto.TPut, rc.enc.B, data))
 }
 
 func readSmall(path string, buf []byte) ([]byte, error) {
@@ -826,6 +831,7 @@ func (rc *rconn) sendRange(rt *rangeTask) error {
 			return err
 		}
 		s.st.bytesDone.Add(int64(len(ch.buf)))
+		f.progress.Add(int64(len(ch.buf)))
 		s.st.literal.Add(int64(len(ch.buf)))
 		free <- ch.buf[:cap(ch.buf)]
 	}
@@ -845,6 +851,7 @@ type deltaOp struct {
 
 func (rc *rconn) sendDelta(f *fileTask, sig *signature) error {
 	s := rc.s
+	f.state.Store(fileChecking)
 	index := make(map[proto.Hash]int64, len(sig.hashes))
 	var boff int64
 	for i, h := range sig.hashes {
@@ -856,6 +863,7 @@ func (rc *rconn) sendDelta(f *fileTask, sig *signature) error {
 
 	fh, err := rc.open(f)
 	if err != nil {
+		f.failed.Store(true)
 		s.recordErr(fmt.Sprintf("%s: %v", f.e.Path, err))
 		s.st.bytesDone.Add(f.e.Size)
 		return nil
@@ -886,6 +894,7 @@ func (rc *rconn) sendDelta(f *fileTask, sig *signature) error {
 		return nil
 	})
 	if err != nil {
+		f.failed.Store(true)
 		s.recordErr(fmt.Sprintf("%s: %v", f.e.Path, err))
 		s.st.bytesDone.Add(f.e.Size)
 		return nil
@@ -896,9 +905,10 @@ func (rc *rconn) sendDelta(f *fileTask, sig *signature) error {
 		s.st.bytesDone.Add(f.e.Size)
 		s.st.filesDone.Add(1)
 		s.st.metaOnly.Add(1)
-		return rc.sendMeta([]metaUpdate{{path: f.e.Path, kind: scan.KindFile, mode: f.e.Mode, mtime: f.e.Mtime}})
+		return f.finishProgress(rc.sendMeta([]metaUpdate{{path: f.e.Path, kind: scan.KindFile, mode: f.e.Mode, mtime: f.e.Mtime}}))
 	}
 
+	f.state.Store(fileSending)
 	rc.enc.Reset()
 	rc.enc.Uvarint(f.id)
 	rc.enc.Str(f.e.Path)
@@ -916,6 +926,7 @@ func (rc *rconn) sendDelta(f *fileTask, sig *signature) error {
 				return err
 			}
 			matched += op.n
+			f.progress.Add(op.n)
 			continue
 		}
 		for done := int64(0); done < op.n; {
@@ -927,6 +938,7 @@ func (rc *rconn) sendDelta(f *fileTask, sig *signature) error {
 				return err
 			}
 			done += k
+			f.progress.Add(k)
 		}
 		literal += op.n
 	}
@@ -943,7 +955,7 @@ func (rc *rconn) sendDelta(f *fileTask, sig *signature) error {
 	s.st.matched.Add(matched)
 	s.st.bytesDone.Add(f.e.Size)
 	s.st.filesDone.Add(1)
-	return nil
+	return f.finishProgress(nil)
 }
 
 type metaUpdate struct {

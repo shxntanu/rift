@@ -57,11 +57,17 @@ func TestAgentConcurrentStartupAndIdleExit(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sum, err := runAgentClient(ctx, opt)
+			richOpt := opt
+			var progress client.Progress
+			richOpt.Rich = true
+			richOpt.OnProgress = func(p client.Progress) { progress = p }
+			sum, err := runAgentClient(ctx, richOpt)
 			if err != nil {
 				t.Error(err)
 			} else if sum.ErrorCount != 0 {
 				t.Error(sum.Errors)
+			} else if progress.Phase != "Finishing" || progress.FilesDone != progress.FilesTotal || progress.BytesDone != sum.Bytes {
+				t.Errorf("agent lost progress: %+v, summary: %+v", progress, sum)
 			}
 		}()
 	}

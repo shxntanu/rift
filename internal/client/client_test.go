@@ -46,6 +46,9 @@ func TestRunSync(t *testing.T) {
 			}
 			opt := Options{Src: src, Dst: transport.Endpoint{Path: dst}, Conns: 4,
 				Compress: compression, Delete: true, DeltaMin: 128 << 10, Log: io.Discard}
+			var progress Progress
+			opt.Rich = true
+			opt.OnProgress = func(p Progress) { progress = p }
 			run := func() *Summary {
 				t.Helper()
 				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -56,6 +59,10 @@ func TestRunSync(t *testing.T) {
 				}
 				if sum.ErrorCount != 0 {
 					t.Fatalf("remote errors: %v", sum.Errors)
+				}
+				if progress.Phase != "Finishing" || progress.FilesDone != progress.FilesTotal ||
+					progress.BytesDone != sum.Bytes || progress.BytesTotal != sum.Bytes || progress.Failed != 0 {
+					t.Fatalf("incomplete progress: %+v, summary: %+v", progress, sum)
 				}
 				assertSameTree(t, src, dst)
 				return sum

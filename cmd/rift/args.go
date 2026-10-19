@@ -14,6 +14,7 @@ type config struct {
 	compress       int
 	verbose        int
 	quiet          bool
+	rich           bool
 	dryRun         bool
 	checksum       bool
 	del            bool
@@ -153,6 +154,7 @@ var longOpts = map[string]option{
 	"bwlimit":             unsupported(optArg),
 
 	// rift extensions
+	"rich":           flag(func(c *config) { c.rich = true }),
 	"direct":         flag(func(c *config) { c.direct = true }),
 	"conns":          intArg(func(c *config) *int { return &c.conns }),
 	"gitignore":      flag(func(c *config) { c.gitignore = true }),

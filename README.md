@@ -204,12 +204,21 @@ rift's own options:
 
 ```
 -j, --conns=N           maximum connections, 1-32 (default 32; auto-sized)
+    --rich             live overall and per-file progress on a terminal
     --direct           experimental AES-GCM TCP data path, with SSH fallback
     --gitignore         send exactly what git would (see below)
     --delta-min=SIZE    smallest file to delta-transfer (default 128K)
     --no-fast-cipher    don't ask SSH for AES-GCM
     --no-persist        disable the agent and warm server sessions
 ```
+
+Use `rift --rich ./ me@server:/code/project` for live progress bars, file
+names, transfer speed and ETA. The TUI uses Bubble Tea and Bubbles progress
+bars. Active files appear first; queued and completed files fill the remaining
+terminal rows. It also works with `-v`
+and `rift watch`. Redirected output and `TERM=dumb` use plain output;
+`--quiet` suppresses progress, `--dry-run` keeps its change list, and
+`NO_COLOR` disables color.
 
 ### Direct TCP (experimental)
 

@@ -22,6 +22,9 @@ func TestRunnerReusesSessions(t *testing.T) {
 			defer r.Close()
 			src, dst := t.TempDir(), t.TempDir()
 			opt := Options{Src: src, Dst: transport.Endpoint{Path: dst}, Compress: compression, Conns: 4, Delete: true, DeltaMin: 128 << 10, Log: io.Discard}
+			var progress Progress
+			opt.Rich = true
+			opt.OnProgress = func(p Progress) { progress = p }
 			write := func(rel, data string) {
 				t.Helper()
 				p := filepath.Join(src, rel)
@@ -40,6 +43,9 @@ func TestRunnerReusesSessions(t *testing.T) {
 				}
 				if sum.ErrorCount != 0 {
 					t.Fatal(sum.Errors)
+				}
+				if progress.FilesDone != progress.FilesTotal || progress.BytesDone != sum.Bytes || progress.WireOut != sum.WireOut {
+					t.Fatalf("progress did not reset between sessions: %+v, summary: %+v", progress, sum)
 				}
 				assertSameTree(t, opt.Src, opt.Dst.Path)
 				return sum

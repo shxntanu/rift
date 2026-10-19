@@ -24,6 +24,7 @@ import (
 	"github.com/shxntanu/rift/internal/server"
 	"github.com/shxntanu/rift/internal/transport"
 	"github.com/zeebo/xxh3"
+	"golang.org/x/sys/unix"
 )
 
 // Set via -ldflags at build time.
@@ -72,6 +73,7 @@ rsync options:
   -P, --progress, --partial, --stats, -h   accepted
 
 rift options:
+      --rich               live overall and per-file progress on a terminal
   -j, --conns=N            maximum connections (auto-sized, default 32)
       --direct             experimental encrypted TCP data path; SSH fallback
       --gitignore          send exactly what git sees (git ls-files); never
@@ -125,17 +127,17 @@ var logo string
 
 // printLogo shows the logo only where it will render: a truecolor terminal
 // without NO_COLOR.
-func printLogo() {
+func printLogo(out *os.File) {
 	if os.Getenv("NO_COLOR") != "" {
 		return
 	}
 	if ct := os.Getenv("COLORTERM"); ct != "truecolor" && ct != "24bit" {
 		return
 	}
-	if fi, err := os.Stdout.Stat(); err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+	if fi, err := out.Stat(); err != nil || fi.Mode()&os.ModeCharDevice == 0 {
 		return
 	}
-	fmt.Print("\n", logo, "\n")
+	fmt.Fprint(out, "\n", logo, "\n")
 }
 
 type stdio struct{}
@@ -156,12 +158,12 @@ func run(args []string) int {
 		return 1
 	}
 	if cfg.help {
-		printLogo()
+		printLogo(os.Stdout)
 		fmt.Print(usage)
 		return 0
 	}
 	if cfg.version {
-		printLogo()
+		printLogo(os.Stdout)
 		fmt.Printf("rift %s (protocol %d, build %s)\n", version, proto.Version, getBuildID())
 		return 0
 	}
@@ -211,10 +213,8 @@ func run(args []string) int {
 	if len(sshFields) == 0 {
 		sshFields = []string{"ssh"}
 	}
-	isTTY := false
-	if fi, err := os.Stderr.Stat(); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
-		isTTY = true
-	}
+	_, ttyErr := unix.IoctlGetWinsize(int(os.Stderr.Fd()), unix.TIOCGWINSZ)
+	isTTY := ttyErr == nil && os.Getenv("TERM") != "dumb"
 	debug.SetGCPercent(400)
 
 	opt := client.Options{
@@ -234,6 +234,7 @@ func run(args []string) int {
 		ModifyWindow:   cfg.modifyWindow,
 		Verbose:        cfg.verbose > 0 || cfg.dryRun,
 		Progress:       isTTY && !cfg.quiet,
+		Rich:           cfg.rich && isTTY && !cfg.quiet && !cfg.dryRun,
 		Transport: transport.Options{
 			Direct:     cfg.direct,
 			SSH:        sshFields[0],
@@ -248,14 +249,28 @@ func run(args []string) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if opt.Rich {
+		printLogo(os.Stderr)
+	}
 	syncOnce := func() int {
-		var sum *client.Summary
-		var err error
-		if cfg.noPersist {
-			sum, err = client.Run(ctx, opt)
-		} else {
-			sum, err = runAgentClient(ctx, opt)
-		}
+		sum, err := func() (*client.Summary, error) {
+			syncOpt := opt
+			if opt.Rich {
+				display := newRichProgress(os.Stderr)
+				defer func() {
+					if err := display.Close(); err != nil {
+						fmt.Fprintln(os.Stderr, "rift: progress display:", err)
+					}
+				}()
+				syncOpt.Log = display
+				syncOpt.OnProgress = display.Update
+				display.Update(client.Progress{Phase: "Starting sync"})
+			}
+			if cfg.noPersist {
+				return client.Run(ctx, syncOpt)
+			}
+			return runAgentClient(ctx, syncOpt)
+		}()
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "rift:", err)
 			return 1

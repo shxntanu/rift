@@ -44,6 +44,8 @@ type Options struct {
 	ModifyWindow   int64 // seconds of mtime slack when comparing
 	Verbose        bool
 	Progress       bool
+	Rich           bool
+	OnProgress     func(Progress) `json:"-"` // called serially; return promptly
 	Transport      transport.Options
 	Log            io.Writer `json:"-"`
 }
@@ -75,6 +77,8 @@ type fileTask struct {
 	isNew     bool
 	remaining atomic.Int64
 	failed    atomic.Bool
+	progress  atomic.Int64 // logical bytes sent in the current attempt
+	state     atomic.Int32
 }
 
 type stats struct {
@@ -111,9 +115,11 @@ type session struct {
 	errs     []string
 	errCount int
 
-	logMu sync.Mutex
-	start time.Time
-	debug bool
+	logMu        sync.Mutex
+	start        time.Time
+	debug        bool
+	progressPlan atomic.Pointer[progressPlan]
+	wireStart    int64
 }
 
 func (s *session) debugf(format string, args ...any) {
@@ -166,6 +172,8 @@ func (s *session) onServerError(id uint64, code uint8, msg string) {
 	if code == proto.CodeDeltaFailed {
 		s.logf("delta failed for %s (%s), resending in full", f.e.Path, msg)
 		f.isNew = false
+		f.progress.Store(0)
+		f.state.Store(fileSending)
 		s.sched.push(nil, s.fullJobs(f), nil, s.fullPending(f))
 		return
 	}
@@ -268,12 +276,19 @@ func run(ctx context.Context, opt Options, runner *Runner) (*Summary, error) {
 		s.dialer = runner.dialer
 	}
 	wireOut, wireIn := s.dialer.WireOut.Load(), s.dialer.WireIn.Load()
+	s.wireStart = wireOut
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if runner == nil || opt.Transport.Direct {
 		defer func() { _ = s.dialer.Close() }()
 	}
 	s.ctx = ctx
+	stopProgress := func() {}
+	if opt.Rich && opt.OnProgress != nil && !opt.DryRun {
+		s.progressPlan.Store(&progressPlan{phase: "Connecting and scanning"})
+		stopProgress = s.startProgress()
+	}
+	defer func() { stopProgress() }()
 	stopRunner := func() bool { return false }
 	if runner != nil {
 		stopRunner = context.AfterFunc(runner.ctx, cancel)
@@ -407,6 +422,9 @@ func run(ctx context.Context, opt Options, runner *Runner) (*Summary, error) {
 		s.recordErr("remote: " + w)
 	}
 	scanTime := time.Since(start)
+	if opt.Rich {
+		s.progressPlan.Store(&progressPlan{phase: "Planning"})
+	}
 
 	p, err := s.plan(ctx, ctrl, ls.res, remote, filter)
 	if err != nil {
@@ -433,11 +451,11 @@ func run(ctx context.Context, opt Options, runner *Runner) (*Summary, error) {
 		return sum, nil
 	}
 
-	stopProgress := func() {}
-	if opt.Progress && !opt.Verbose {
+	if opt.Rich {
+		s.progressPlan.Store(&progressPlan{phase: "Transferring", files: s.files[1:]})
+	} else if opt.Progress && !opt.Verbose {
 		stopProgress = s.startProgress()
 	}
-	defer stopProgress()
 
 	if err := ctrl.sendDeletes(p.conflicts, proto.DeleteRecursive); err != nil {
 		return nil, err
@@ -511,7 +529,11 @@ func run(ctx context.Context, opt Options, runner *Runner) (*Summary, error) {
 			return nil, err
 		}
 	}
-	stopProgress()
+	if opt.Rich {
+		s.progressPlan.Store(&progressPlan{phase: "Finishing", files: s.files[1:]})
+	} else {
+		stopProgress()
+	}
 	s.debugf("transfer complete")
 	// Collect errors from the final batch before taking the summary.
 	if err := shutdown(); err != nil {

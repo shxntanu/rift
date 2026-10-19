@@ -27,9 +27,10 @@ type agentRequest struct {
 	Env     []string
 }
 type agentResponse struct {
-	Log     string
-	Summary *client.Summary
-	Error   string
+	Log      string
+	Progress *client.Progress
+	Summary  *client.Summary
+	Error    string
 }
 type agentLog struct {
 	mu  sync.Mutex
@@ -44,6 +45,13 @@ func (l *agentLog) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	return len(p), nil
+}
+
+func (l *agentLog) progress(p client.Progress) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// A disconnected foreground client cancels the request's context.
+	_ = l.enc.Encode(agentResponse{Progress: &p})
 }
 
 func agentDir() (string, error) {
@@ -153,6 +161,9 @@ func runAgentClient(ctx context.Context, opt client.Options) (*client.Summary, e
 			if _, err := io.WriteString(opt.Log, res.Log); err != nil {
 				return nil, err
 			}
+		}
+		if res.Progress != nil && opt.OnProgress != nil {
+			opt.OnProgress(*res.Progress)
 		}
 		if res.Error != "" {
 			return nil, errors.New(res.Error)
@@ -294,6 +305,9 @@ func serveAgentFor(ctx context.Context, idle time.Duration) error {
 			}
 			logger := &agentLog{enc: enc}
 			req.Options.Log = logger
+			if req.Options.Rich {
+				req.Options.OnProgress = logger.progress
+			}
 
 			sum, err := runner.Run(reqCtx, req.Options)
 			res := agentResponse{Summary: sum}
