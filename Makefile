@@ -28,8 +28,13 @@ cross:
 	done
 
 install: all
-	mkdir -p $(PREFIX)/bin
-	cp bin/rift bin/rift-* $(PREFIX)/bin/
+	mkdir -p "$(PREFIX)/bin"
+	@set -eu; \
+	stage=$$(mktemp -d "$(PREFIX)/bin/.rift-install.XXXXXX"); \
+	trap 'rm -rf "$$stage"' EXIT; \
+	trap 'exit 1' HUP INT TERM; \
+	cp bin/rift bin/rift-* "$$stage/"; \
+	for binary in "$$stage"/*; do mv -f "$$binary" "$(PREFIX)/bin/"; done
 
 release:
 	sh scripts/release.sh "$(VERSION)"
